@@ -15,7 +15,7 @@ DATA_SOURCE_ID = os.getenv("NOTION_DATA_SOURCE_ID")
 # GitHub Actions will usually pass CSV_PATH explicitly.
 # If CSV_PATH is not set, the script will pick the newest CSV from CSV_GLOB.
 CSV_PATH = Path(os.environ["CSV_PATH"]) if os.getenv("CSV_PATH") else None
-CSV_GLOB = os.getenv("CSV_GLOB", "data/incoming/*.csv")
+CSV_GLOB = os.getenv("CSV_GLOB", "data/incoming/**/*.csv")
 
 VIEWS_API_VERSION = "2026-03-11"
 CHART_VIEW_PREFIX = "WoW - "
@@ -641,20 +641,41 @@ def resolve_csv_path():
 
     Priority:
     1. CSV_PATH environment variable, passed by GitHub Actions.
-    2. Newest CSV matching CSV_GLOB, defaulting to data/incoming/*.csv.
+    2. Newest CSV matching CSV_GLOB, defaulting to data/incoming/**/*.csv.
+    3. Newest direct CSV under data/incoming/*.csv as a fallback.
     """
     if CSV_PATH:
-        return CSV_PATH
+        if CSV_PATH.exists():
+            return CSV_PATH
+
+        raise FileNotFoundError(f"CSV_PATH was set but the file does not exist: {CSV_PATH}")
+
+    search_patterns = [CSV_GLOB]
+
+    # If CSV_GLOB was overridden, still keep the normal Zapier folder as a fallback.
+    if CSV_GLOB != "data/incoming/**/*.csv":
+        search_patterns.append("data/incoming/**/*.csv")
+
+    search_patterns.append("data/incoming/*.csv")
+
+    csv_files = []
+    seen_paths = set()
+
+    for pattern in search_patterns:
+        for path in Path(".").glob(pattern):
+            if path.is_file() and path.suffix.lower() == ".csv" and path not in seen_paths:
+                csv_files.append(path)
+                seen_paths.add(path)
 
     csv_files = sorted(
-        Path(".").glob(CSV_GLOB),
+        csv_files,
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
 
     if not csv_files:
         raise FileNotFoundError(
-            f"No CSV files found. Set CSV_PATH or add a file matching CSV_GLOB={CSV_GLOB!r}."
+            "No CSV files found. Set CSV_PATH or add a CSV under data/incoming/."
         )
 
     return csv_files[0]
