@@ -1208,6 +1208,7 @@ def sync_chart_views(data_source_id, wbr_context):
             properties_by_name,
             metric_name,
             color_theme,
+            wbr_context,
         )
         existing_view = existing_views_by_name.get(payload["name"])
 
