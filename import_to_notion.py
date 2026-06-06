@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import os
 from datetime import date, datetime
 from pathlib import Path
@@ -39,6 +40,18 @@ NUMBER_FIELDS = (
 )
 
 DATE_FIELD = "Interaction Date Dynamic"
+
+# WBR snapshot metadata.
+# Each CSV represents one rolling WBR review window.
+# The latest date in the CSV becomes the WBR Review Week.
+WBR_REVIEW_WEEK_FIELD = "WBR Review Week"
+WBR_REVIEW_KEY_FIELD = "WBR Review Key"
+UNIQUE_ROW_KEY_FIELD = "Unique Row Key"
+SOURCE_FILE_FIELD = "Source File"
+FILE_HASH_FIELD = "File Hash"
+WINDOW_START_FIELD = "Window Start"
+WINDOW_END_FIELD = "Window End"
+
 METRIC_FIELDS = (
     "Eligible Calls [#]",
     "AI CSAT Call [%]",
@@ -122,6 +135,13 @@ WBR_TREND_FIELDS = (
 
 PROPERTY_SCHEMAS = {
     DATE_FIELD: {"date": {}},
+    WBR_REVIEW_WEEK_FIELD: {"date": {}},
+    WBR_REVIEW_KEY_FIELD: {"rich_text": {}},
+    UNIQUE_ROW_KEY_FIELD: {"rich_text": {}},
+    SOURCE_FILE_FIELD: {"rich_text": {}},
+    FILE_HASH_FIELD: {"rich_text": {}},
+    WINDOW_START_FIELD: {"date": {}},
+    WINDOW_END_FIELD: {"date": {}},
     "Eligible Calls [#]": {"number": {"format": "number_with_commas"}},
     "AI CSAT Call [%]": {"number": {"format": "percent"}},
     "AI CSAT Call Participation Rate [%]": {"number": {"format": "percent"}},
@@ -560,17 +580,46 @@ def render_wbr_combo_chart(csv_rows, output_path):
     return output_path
 
 
-def build_page_properties(row, title_property_name):
+def build_page_properties(row, title_property_name, wbr_context):
     interaction_date = clean_value(row[DATE_FIELD])
     if not interaction_date:
         raise ValueError(f"Missing required date field: {DATE_FIELD}")
 
+    unique_row_key = f"{wbr_context['review_week']}::{interaction_date}"
+
     properties = {
         title_property_name: {
-            "title": [{"text": {"content": interaction_date}}],
+            "title": [
+                {
+                    "text": {
+                        "content": f"{wbr_context['review_week']} - {interaction_date}",
+                    }
+                }
+            ],
         },
         DATE_FIELD: {
             "date": {"start": interaction_date},
+        },
+        WBR_REVIEW_WEEK_FIELD: {
+            "date": {"start": wbr_context["review_week"]},
+        },
+        WBR_REVIEW_KEY_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["review_key"]}}],
+        },
+        UNIQUE_ROW_KEY_FIELD: {
+            "rich_text": [{"text": {"content": unique_row_key}}],
+        },
+        SOURCE_FILE_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["source_file"]}}],
+        },
+        FILE_HASH_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["file_hash"]}}],
+        },
+        WINDOW_START_FIELD: {
+            "date": {"start": wbr_context["window_start"]},
+        },
+        WINDOW_END_FIELD: {
+            "date": {"start": wbr_context["window_end"]},
         },
     }
 
@@ -585,7 +634,6 @@ def build_page_properties(row, title_property_name):
             properties[field_name] = {"number": percent}
 
     return properties
-
 
 
 def resolve_csv_path():
@@ -610,6 +658,43 @@ def resolve_csv_path():
         )
 
     return csv_files[0]
+
+
+def file_sha256(file_path):
+    hasher = hashlib.sha256()
+
+    with file_path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
+
+
+def build_wbr_context(csv_path, csv_rows):
+    rows = sorted_rows_by_date(csv_rows)
+    if not rows:
+        raise ValueError("Cannot build WBR context without CSV rows.")
+
+    window_start = rows[0][DATE_FIELD]
+    window_end = rows[-1][DATE_FIELD]
+    review_week = window_end
+
+    return {
+        "review_week": review_week,
+        "review_key": f"WBR::{review_week}",
+        "window_start": window_start,
+        "window_end": window_end,
+        "source_file": csv_path.name,
+        "file_hash": file_sha256(csv_path),
+    }
+
+
+def wbr_review_filter(review_week):
+    return {
+        "property": WBR_REVIEW_WEEK_FIELD,
+        "date": {"equals": review_week},
+    }
+
 
 def read_csv_rows(csv_path):
     if not csv_path.exists():
@@ -656,6 +741,23 @@ def find_page_for_date(interaction_date):
             "filter": {
                 "property": DATE_FIELD,
                 "date": {"equals": interaction_date},
+            },
+            "page_size": 1,
+        },
+    )
+    results = result.get("results", [])
+    return results[0] if results else None
+
+
+
+def find_page_for_unique_row_key(unique_row_key):
+    result = notion_request(
+        "POST",
+        f"/databases/{DATABASE_ID}/query",
+        json={
+            "filter": {
+                "property": UNIQUE_ROW_KEY_FIELD,
+                "rich_text": {"equals": unique_row_key},
             },
             "page_size": 1,
         },
@@ -914,7 +1016,7 @@ def build_chart_configuration(date_property_id, metric_property_id, metric_name,
     }
 
 
-def build_chart_payload(data_source_id, properties_by_name, metric_name, color_theme):
+def build_chart_payload(data_source_id, properties_by_name, metric_name, color_theme, wbr_context):
     date_property_id = properties_by_name[DATE_FIELD]["id"]
     metric_property_id = properties_by_name[metric_name]["id"]
 
@@ -923,6 +1025,7 @@ def build_chart_payload(data_source_id, properties_by_name, metric_name, color_t
         "data_source_id": data_source_id,
         "name": f"{CHART_VIEW_PREFIX}{metric_name}",
         "type": "chart",
+        "filter": wbr_review_filter(wbr_context["review_week"]),
         "sorts": [
             {
                 "property": DATE_FIELD,
@@ -1010,8 +1113,13 @@ def build_wbr_kpi_payload(data_source_id, properties_by_name, metric_name, color
         "name": f"{WBR_VIEW_PREFIX}KPI - {metric_name}",
         "type": "chart",
         "filter": {
-            "property": DATE_FIELD,
-            "date": {"equals": summary["latest_date"]},
+            "and": [
+                wbr_review_filter(summary["latest_date"]),
+                {
+                    "property": DATE_FIELD,
+                    "date": {"equals": summary["latest_date"]},
+                },
+            ]
         },
         "configuration": build_wbr_number_configuration(
             metric_property_id,
@@ -1030,6 +1138,7 @@ def build_wbr_trend_payload(data_source_id, properties_by_name, metric_name, col
         "data_source_id": data_source_id,
         "name": f"{WBR_VIEW_PREFIX}Trend - {metric_name}",
         "type": "chart",
+        "filter": wbr_review_filter(summary["latest_date"]),
         "sorts": [
             {
                 "property": DATE_FIELD,
@@ -1074,12 +1183,12 @@ def update_view(view_id, payload):
     )
 
 
-def sync_chart_views(data_source_id):
+def sync_chart_views(data_source_id, wbr_context):
     data_source = retrieve_data_source(data_source_id)
     properties_by_name = data_source["properties"]
     missing_properties = [
         property_name
-        for property_name in (DATE_FIELD, *METRIC_FIELDS)
+        for property_name in (DATE_FIELD, WBR_REVIEW_WEEK_FIELD, *METRIC_FIELDS)
         if property_name not in properties_by_name
     ]
 
@@ -1149,7 +1258,7 @@ def sync_wbr_example_views(data_source_id, csv_rows):
     properties_by_name = data_source["properties"]
     missing_properties = [
         property_name
-        for property_name in (DATE_FIELD, *WBR_TREND_FIELDS)
+        for property_name in (DATE_FIELD, WBR_REVIEW_WEEK_FIELD, *WBR_TREND_FIELDS)
         if property_name not in properties_by_name
     ]
 
@@ -1216,21 +1325,32 @@ def main():
     title_property_name = get_title_property_name(database)
     ensure_database_properties(database)
 
+    wbr_context = build_wbr_context(csv_path, csv_rows)
+    print(
+        "WBR snapshot: "
+        f"review_week={wbr_context['review_week']}, "
+        f"window={wbr_context['window_start']} to {wbr_context['window_end']}, "
+        f"source_file={wbr_context['source_file']}"
+    )
+
     print("Syncing Notion pages...")
     created_count = 0
     updated_count = 0
     for row in csv_rows:
-        properties = build_page_properties(row, title_property_name)
-        existing_page = find_page_for_date(row[DATE_FIELD])
+        interaction_date = clean_value(row[DATE_FIELD])
+        unique_row_key = f"{wbr_context['review_week']}::{interaction_date}"
+
+        properties = build_page_properties(row, title_property_name, wbr_context)
+        existing_page = find_page_for_unique_row_key(unique_row_key)
 
         if existing_page:
             update_notion_page(existing_page["id"], properties)
             updated_count += 1
-            print(f"  - Updated {row[DATE_FIELD]}")
+            print(f"  - Updated {unique_row_key}")
         else:
             create_notion_page(properties)
             created_count += 1
-            print(f"  - Added {row[DATE_FIELD]}")
+            print(f"  - Added {unique_row_key}")
 
     print("Syncing week-on-week chart views...")
     view_database = notion_request(
@@ -1239,7 +1359,7 @@ def main():
         headers=VIEW_HEADERS,
     )
     data_source_id = get_data_source_id(view_database)
-    created_charts, updated_charts = sync_chart_views(data_source_id)
+    created_charts, updated_charts = sync_chart_views(data_source_id, wbr_context)
 
     print("Syncing example WBR dashboard...")
     wbr_result = sync_wbr_example_views(data_source_id, csv_rows)
