@@ -23,6 +23,7 @@ jobs:
       NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
       CREATE_NOTION_CHART_VIEWS: "true"
       FAIL_ON_CHART_ERRORS: "false"
+      CREATE_CHARTS_INSIDE_WBR_PAGE: "true"
 
     steps:
       - name: Check out repository
