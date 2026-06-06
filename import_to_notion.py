@@ -406,7 +406,18 @@ def build_wbr_metric_summary(csv_rows):
 
 
 def load_font(size, bold=False):
+    """Load a real scalable font on GitHub Actions, macOS, or local machines.
+
+    Without Linux font paths, GitHub Actions falls back to PIL's tiny bitmap
+    default font, which makes the chart text unreadable in Notion.
+    """
     font_candidates = [
+        # GitHub Actions / Ubuntu
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+
+        # macOS
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
         "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Helvetica.ttf",
         "/Library/Fonts/Arial Bold.ttf" if bold else "/Library/Fonts/Arial.ttf",
@@ -416,7 +427,11 @@ def load_font(size, bold=False):
         if Path(font_path).exists():
             return ImageFont.truetype(font_path, size=size)
 
-    return ImageFont.load_default()
+    # Last resort: try PIL's bundled DejaVu font name.
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size=size)
+    except OSError:
+        return ImageFont.load_default()
 
 
 def draw_centered_text(draw, xy, text, font, fill):
@@ -739,28 +754,28 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
     ]
 
     scale = 2
-    width, height = 1700 * scale, 1050 * scale
+    width, height = 1400 * scale, 1050 * scale
     card_margin = 40 * scale
     plot_left = 150 * scale
-    plot_right = 1580 * scale
-    plot_top = 405 * scale
-    plot_bottom = 790 * scale
+    plot_right = 1290 * scale
+    plot_top = 450 * scale
+    plot_bottom = 810 * scale
     plot_width = plot_right - plot_left
     plot_height = plot_bottom - plot_top
 
     image = Image.new("RGBA", (width, height), (248, 250, 252, 255))
     draw = ImageDraw.Draw(image)
 
-    font_title = load_font(48 * scale, bold=True)
-    font_subtitle = load_font(24 * scale)
-    font_card_label = load_font(20 * scale, bold=True)
-    font_card_value = load_font(36 * scale, bold=True)
-    font_card_note = load_font(19 * scale)
-    font_axis = load_font(22 * scale, bold=True)
-    font_tick = load_font(20 * scale)
-    font_point_label = load_font(20 * scale, bold=True)
-    font_reference = load_font(18 * scale, bold=True)
-    font_footer = load_font(18 * scale)
+    font_title = load_font(58 * scale, bold=True)
+    font_subtitle = load_font(30 * scale)
+    font_card_label = load_font(26 * scale, bold=True)
+    font_card_value = load_font(48 * scale, bold=True)
+    font_card_note = load_font(24 * scale)
+    font_axis = load_font(28 * scale, bold=True)
+    font_tick = load_font(26 * scale)
+    font_point_label = load_font(26 * scale, bold=True)
+    font_reference = load_font(24 * scale, bold=True)
+    font_footer = load_font(24 * scale)
 
     colors = {
         "page": (248, 250, 252, 255),
@@ -854,9 +869,9 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
     draw.text((plot_right - status_width + 21 * scale, 95 * scale), status_text, font=font_card_label, fill=status_color)
 
     # KPI cards
-    card_top = 195 * scale
-    card_height = 120 * scale
-    card_gap = 22 * scale
+    card_top = 205 * scale
+    card_height = 145 * scale
+    card_gap = 18 * scale
     card_width = (plot_right - plot_left - 3 * card_gap) / 4
     card_xs = [plot_left + i * (card_width + card_gap) for i in range(4)]
 
@@ -877,8 +892,8 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
         )
         draw.rectangle((x, card_top, x + 7 * scale, card_top + card_height), fill=accent)
         draw.text((x + 24 * scale, card_top + 18 * scale), label.upper(), font=font_card_label, fill=colors["muted"])
-        draw.text((x + 24 * scale, card_top + 47 * scale), value, font=font_card_value, fill=accent)
-        draw.text((x + 24 * scale, card_top + 91 * scale), note, font=font_card_note, fill=colors["muted"])
+        draw.text((x + 24 * scale, card_top + 55 * scale), value, font=font_card_value, fill=accent)
+        draw.text((x + 24 * scale, card_top + 112 * scale), note, font=font_card_note, fill=colors["muted"])
 
     # Chart scaling
     y_min = metric_chart_y_min(metric_name, display_values, reference_values)
