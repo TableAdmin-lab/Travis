@@ -12,10 +12,24 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
 DATA_SOURCE_ID = os.getenv("NOTION_DATA_SOURCE_ID")
 
+# Optional but recommended:
+# Create a second Notion database called "WBR Reviews" and store its ID in this secret.
+# The current NOTION_DATABASE_ID remains your row-level "WBR Rows" database.
+WBR_REVIEWS_DATABASE_ID = (
+    os.getenv("NOTION_WBR_REVIEWS_DATABASE_ID")
+    or os.getenv("WBR_REVIEWS_DATABASE_ID")
+)
+
+# Notion chart views via the Views API can be fragile while the data model is changing.
+# Default to generated chart images attached to each WBR Review page.
+# Set CREATE_NOTION_CHART_VIEWS=true if you want the script to also try Notion chart views.
+CREATE_NOTION_CHART_VIEWS = os.getenv("CREATE_NOTION_CHART_VIEWS", "true").lower() == "true"
+FAIL_ON_CHART_ERRORS = os.getenv("FAIL_ON_CHART_ERRORS", "false").lower() == "true"
+
 # GitHub Actions will usually pass CSV_PATH explicitly.
 # If CSV_PATH is not set, the script will pick the newest CSV from CSV_GLOB.
 CSV_PATH = Path(os.environ["CSV_PATH"]) if os.getenv("CSV_PATH") else None
-CSV_GLOB = os.getenv("CSV_GLOB", "data/incoming/**/*.csv")
+CSV_GLOB = os.getenv("CSV_GLOB", "data/incoming/*.csv")
 
 VIEWS_API_VERSION = "2026-03-11"
 CHART_VIEW_PREFIX = "WoW - "
@@ -51,6 +65,7 @@ SOURCE_FILE_FIELD = "Source File"
 FILE_HASH_FIELD = "File Hash"
 WINDOW_START_FIELD = "Window Start"
 WINDOW_END_FIELD = "Window End"
+WBR_REVIEW_RELATION_FIELD = "WBR Review"
 
 METRIC_FIELDS = (
     "Eligible Calls [#]",
@@ -82,37 +97,37 @@ CHART_AGGREGATORS = {
 WBR_TARGETS = {
     "AI CSAT Call [%]": {
         "value": 0.70,
-        "label": "Example target 70%",
+        "label": "Expected 70%",
         "color": "green",
         "dash_style": "dash",
     },
     "AI CSAT Call Participation Rate [%]": {
         "value": 0.75,
-        "label": "Example target 75%",
+        "label": "Expected 75%",
         "color": "green",
         "dash_style": "dash",
     },
     "Abandoned Call Rate [%]": {
         "value": 0.03,
-        "label": "Example max 3%",
+        "label": "Expected max 3%",
         "color": "red",
         "dash_style": "dash",
     },
     "Calls Within Hunting Time SLA [%]": {
         "value": 0.85,
-        "label": "Example target 85%",
+        "label": "Expected 85%",
         "color": "green",
         "dash_style": "dash",
     },
     "Average Call Hunting Time [min]": {
         "value": 1.00,
-        "label": "Example max 1.0 min",
+        "label": "Expected max 1.0 min",
         "color": "orange",
         "dash_style": "dash",
     },
     "Average Call Handling Time [min]": {
         "value": 5.00,
-        "label": "Example benchmark 5.0 min",
+        "label": "Expected 5.0 min",
         "color": "orange",
         "dash_style": "dash",
     },
@@ -133,7 +148,7 @@ WBR_TREND_FIELDS = (
     "Average Call Handling Time [min]",
 )
 
-PROPERTY_SCHEMAS = {
+ROW_PROPERTY_SCHEMAS = {
     DATE_FIELD: {"date": {}},
     WBR_REVIEW_WEEK_FIELD: {"date": {}},
     WBR_REVIEW_KEY_FIELD: {"rich_text": {}},
@@ -189,17 +204,17 @@ def get_title_property_name(database):
     raise RuntimeError("Could not find a title property in the Notion database.")
 
 
-def ensure_database_properties(database):
+def ensure_database_properties(database, database_id, property_schemas):
     existing_properties = database["properties"]
     incompatible_properties = []
     properties_to_update = {}
     properties_to_add = {
         name: schema
-        for name, schema in PROPERTY_SCHEMAS.items()
+        for name, schema in property_schemas.items()
         if name not in existing_properties
     }
 
-    for property_name, property_schema in PROPERTY_SCHEMAS.items():
+    for property_name, property_schema in property_schemas.items():
         if property_name not in existing_properties:
             continue
 
@@ -244,9 +259,36 @@ def ensure_database_properties(database):
 
     notion_request(
         "PATCH",
-        f"/databases/{DATABASE_ID}",
+        f"/databases/{database_id}",
         json={"properties": properties_to_patch},
     )
+
+
+def build_row_property_schemas():
+    schemas = dict(ROW_PROPERTY_SCHEMAS)
+
+    if WBR_REVIEWS_DATABASE_ID:
+        schemas[WBR_REVIEW_RELATION_FIELD] = {
+            "relation": {
+                "database_id": WBR_REVIEWS_DATABASE_ID,
+                "type": "single_property",
+                "single_property": {},
+            }
+        }
+
+    return schemas
+
+
+REVIEW_PROPERTY_SCHEMAS = {
+    WBR_REVIEW_KEY_FIELD: {"rich_text": {}},
+    WBR_REVIEW_WEEK_FIELD: {"date": {}},
+    WINDOW_START_FIELD: {"date": {}},
+    WINDOW_END_FIELD: {"date": {}},
+    SOURCE_FILE_FIELD: {"rich_text": {}},
+    FILE_HASH_FIELD: {"rich_text": {}},
+    "Status": {"select": {"options": [{"name": "Imported", "color": "green"}]}},
+    "Rows Imported": {"number": {"format": "number"}},
+}
 
 
 def clean_value(value):
@@ -329,13 +371,29 @@ def build_wbr_metric_summary(csv_rows):
     for metric_name in METRIC_FIELDS:
         current_value = parse_metric_value(latest_row, metric_name)
         previous_value = parse_metric_value(previous_row, metric_name) if previous_row else None
+        metric_values = [
+            parse_metric_value(row, metric_name)
+            for row in rows
+        ]
+        metric_values = [
+            value
+            for value in metric_values
+            if value is not None
+        ]
+        rolling_average = (
+            sum(metric_values) / len(metric_values)
+            if metric_values
+            else None
+        )
         summary["metrics"][metric_name] = {
             "current": current_value,
             "previous": previous_value,
+            "average": rolling_average,
             "caption": (
                 f"Current week {summary['latest_date']}: "
                 f"{format_metric_value(metric_name, current_value)}; "
-                f"{format_wow_change(metric_name, current_value, previous_value)}"
+                f"{format_wow_change(metric_name, current_value, previous_value)}; "
+                f"8-week avg {format_metric_value(metric_name, rolling_average)}"
             ),
         }
 
@@ -623,6 +681,12 @@ def build_page_properties(row, title_property_name, wbr_context):
         },
     }
 
+    review_page_id = wbr_context.get("review_page_id")
+    if review_page_id and WBR_REVIEWS_DATABASE_ID:
+        properties[WBR_REVIEW_RELATION_FIELD] = {
+            "relation": [{"id": review_page_id}],
+        }
+
     for field_name in NUMBER_FIELDS:
         number = parse_number(row[field_name])
         if number is not None:
@@ -641,41 +705,20 @@ def resolve_csv_path():
 
     Priority:
     1. CSV_PATH environment variable, passed by GitHub Actions.
-    2. Newest CSV matching CSV_GLOB, defaulting to data/incoming/**/*.csv.
-    3. Newest direct CSV under data/incoming/*.csv as a fallback.
+    2. Newest CSV matching CSV_GLOB, defaulting to data/incoming/*.csv.
     """
     if CSV_PATH:
-        if CSV_PATH.exists():
-            return CSV_PATH
-
-        raise FileNotFoundError(f"CSV_PATH was set but the file does not exist: {CSV_PATH}")
-
-    search_patterns = [CSV_GLOB]
-
-    # If CSV_GLOB was overridden, still keep the normal Zapier folder as a fallback.
-    if CSV_GLOB != "data/incoming/**/*.csv":
-        search_patterns.append("data/incoming/**/*.csv")
-
-    search_patterns.append("data/incoming/*.csv")
-
-    csv_files = []
-    seen_paths = set()
-
-    for pattern in search_patterns:
-        for path in Path(".").glob(pattern):
-            if path.is_file() and path.suffix.lower() == ".csv" and path not in seen_paths:
-                csv_files.append(path)
-                seen_paths.add(path)
+        return CSV_PATH
 
     csv_files = sorted(
-        csv_files,
+        Path(".").glob(CSV_GLOB),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
 
     if not csv_files:
         raise FileNotFoundError(
-            "No CSV files found. Set CSV_PATH or add a CSV under data/incoming/."
+            f"No CSV files found. Set CSV_PATH or add a file matching CSV_GLOB={CSV_GLOB!r}."
         )
 
     return csv_files[0]
@@ -741,6 +784,100 @@ def read_csv_rows(csv_path):
         for row in data_rows
         if any(clean_value(value) for value in row)
     ]
+
+
+def build_wbr_review_properties(title_property_name, wbr_context, row_count):
+    return {
+        title_property_name: {
+            "title": [
+                {
+                    "text": {
+                        "content": f"WBR - {wbr_context['review_week']}",
+                    }
+                }
+            ],
+        },
+        WBR_REVIEW_KEY_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["review_key"]}}],
+        },
+        WBR_REVIEW_WEEK_FIELD: {
+            "date": {"start": wbr_context["review_week"]},
+        },
+        WINDOW_START_FIELD: {
+            "date": {"start": wbr_context["window_start"]},
+        },
+        WINDOW_END_FIELD: {
+            "date": {"start": wbr_context["window_end"]},
+        },
+        SOURCE_FILE_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["source_file"]}}],
+        },
+        FILE_HASH_FIELD: {
+            "rich_text": [{"text": {"content": wbr_context["file_hash"]}}],
+        },
+        "Status": {
+            "select": {"name": "Imported"},
+        },
+        "Rows Imported": {
+            "number": row_count,
+        },
+    }
+
+
+def find_wbr_review_page(review_key):
+    if not WBR_REVIEWS_DATABASE_ID:
+        return None
+
+    result = notion_request(
+        "POST",
+        f"/databases/{WBR_REVIEWS_DATABASE_ID}/query",
+        json={
+            "filter": {
+                "property": WBR_REVIEW_KEY_FIELD,
+                "rich_text": {"equals": review_key},
+            },
+            "page_size": 1,
+        },
+    )
+
+    results = result.get("results", [])
+    return results[0] if results else None
+
+
+def create_wbr_review_page(properties):
+    return notion_request(
+        "POST",
+        "/pages",
+        json={
+            "parent": {"database_id": WBR_REVIEWS_DATABASE_ID},
+            "properties": properties,
+        },
+    )
+
+
+def get_or_create_wbr_review_page(wbr_context, row_count):
+    if not WBR_REVIEWS_DATABASE_ID:
+        return None
+
+    review_database = notion_request("GET", f"/databases/{WBR_REVIEWS_DATABASE_ID}")
+    review_title_property = get_title_property_name(review_database)
+    ensure_database_properties(
+        review_database,
+        WBR_REVIEWS_DATABASE_ID,
+        REVIEW_PROPERTY_SCHEMAS,
+    )
+
+    properties = build_wbr_review_properties(review_title_property, wbr_context, row_count)
+    existing_page = find_wbr_review_page(wbr_context["review_key"])
+
+    if existing_page:
+        update_notion_page(existing_page["id"], properties)
+        print(f"  - Updated WBR Review page: {wbr_context['review_key']}")
+        return existing_page
+
+    review_page = create_wbr_review_page(properties)
+    print(f"  - Created WBR Review page: {wbr_context['review_key']}")
+    return review_page
 
 
 def create_notion_page(properties):
@@ -907,7 +1044,7 @@ def append_wbr_combo_chart_to_page(page_id, file_upload_id, latest_date):
     )
 
 
-def push_wbr_combo_chart_to_notion(csv_rows, title_property_name):
+def push_wbr_combo_chart_to_notion(csv_rows, title_property_name, review_page_id=None):
     summary = build_wbr_metric_summary(csv_rows)
     latest_date = summary["latest_date"]
     report_title = f"{WBR_REPORT_TITLE_PREFIX}{latest_date}"
@@ -915,6 +1052,15 @@ def push_wbr_combo_chart_to_notion(csv_rows, title_property_name):
 
     render_wbr_combo_chart(csv_rows, output_path)
     upload = upload_file_to_notion(output_path)
+
+    if review_page_id:
+        append_wbr_combo_chart_to_page(review_page_id, upload["id"], latest_date)
+        return {
+            "report_title": f"WBR - {latest_date}",
+            "page_id": review_page_id,
+            "image_path": str(output_path),
+        }
+
     report_page = get_or_create_report_page(title_property_name, report_title)
     append_wbr_combo_chart_to_page(report_page["id"], upload["id"], latest_date)
 
@@ -1044,7 +1190,7 @@ def build_chart_payload(data_source_id, properties_by_name, metric_name, color_t
     return {
         "database_id": DATABASE_ID,
         "data_source_id": data_source_id,
-        "name": f"{CHART_VIEW_PREFIX}{metric_name}",
+        "name": f"{CHART_VIEW_PREFIX}{wbr_context['review_week']} - {metric_name}",
         "type": "chart",
         "filter": wbr_review_filter(wbr_context["review_week"]),
         "sorts": [
@@ -1060,6 +1206,26 @@ def build_chart_payload(data_source_id, properties_by_name, metric_name, color_t
             color_theme,
         ),
     }
+
+
+def build_reference_lines(metric_name, summary):
+    reference_lines = []
+
+    if metric_name in WBR_TARGETS:
+        reference_lines.append(WBR_TARGETS[metric_name])
+
+    rolling_average = summary["metrics"][metric_name].get("average")
+    if rolling_average is not None:
+        reference_lines.append(
+            {
+                "value": rolling_average,
+                "label": "Rolling 8-week avg",
+                "color": "gray",
+                "dash_style": "dot",
+            }
+        )
+
+    return reference_lines
 
 
 def build_wbr_number_configuration(metric_property_id, metric_name, color_theme, summary):
@@ -1120,8 +1286,9 @@ def build_wbr_trend_configuration(
             }
         )
 
-    if metric_name in WBR_TARGETS:
-        configuration["reference_lines"] = [WBR_TARGETS[metric_name]]
+    reference_lines = build_reference_lines(metric_name, summary)
+    if reference_lines:
+        configuration["reference_lines"] = reference_lines
 
     return configuration
 
@@ -1131,7 +1298,7 @@ def build_wbr_kpi_payload(data_source_id, properties_by_name, metric_name, color
 
     return {
         "data_source_id": data_source_id,
-        "name": f"{WBR_VIEW_PREFIX}KPI - {metric_name}",
+        "name": f"{WBR_VIEW_PREFIX}{summary['latest_date']} - KPI - {metric_name}",
         "type": "chart",
         "filter": {
             "and": [
@@ -1157,7 +1324,7 @@ def build_wbr_trend_payload(data_source_id, properties_by_name, metric_name, col
 
     return {
         "data_source_id": data_source_id,
-        "name": f"{WBR_VIEW_PREFIX}Trend - {metric_name}",
+        "name": f"{WBR_VIEW_PREFIX}{summary['latest_date']} - Trend - {metric_name}",
         "type": "chart",
         "filter": wbr_review_filter(summary["latest_date"]),
         "sorts": [
@@ -1245,8 +1412,9 @@ def sync_chart_views(data_source_id, wbr_context):
     return created_count, updated_count
 
 
-def ensure_wbr_dashboard(data_source_id, existing_views_by_name):
-    existing_dashboard = existing_views_by_name.get(WBR_DASHBOARD_NAME)
+def ensure_wbr_dashboard(data_source_id, existing_views_by_name, review_week):
+    dashboard_name = f"{WBR_VIEW_PREFIX}{review_week} - Overview"
+    existing_dashboard = existing_views_by_name.get(dashboard_name)
     if existing_dashboard:
         return existing_dashboard, False
 
@@ -1254,11 +1422,11 @@ def ensure_wbr_dashboard(data_source_id, existing_views_by_name):
         {
             "database_id": DATABASE_ID,
             "data_source_id": data_source_id,
-            "name": WBR_DASHBOARD_NAME,
+            "name": dashboard_name,
             "type": "dashboard",
         }
     )
-    print(f"  - Created dashboard: {WBR_DASHBOARD_NAME}")
+    print(f"  - Created dashboard: {dashboard_name}")
     return dashboard, True
 
 
@@ -1291,8 +1459,8 @@ def sync_wbr_example_views(data_source_id, csv_rows):
 
     summary = build_wbr_metric_summary(csv_rows)
     existing_views_by_name = get_existing_views_by_name(DATABASE_ID, data_source_id)
-    dashboard, dashboard_created = ensure_wbr_dashboard(data_source_id, existing_views_by_name)
-    existing_views_by_name[WBR_DASHBOARD_NAME] = dashboard
+    dashboard, dashboard_created = ensure_wbr_dashboard(data_source_id, existing_views_by_name, summary["latest_date"])
+    existing_views_by_name[dashboard["name"]] = dashboard
 
     created_count = 0
     updated_count = 0
@@ -1345,7 +1513,7 @@ def main():
     print("Checking Notion database schema...")
     database = notion_request("GET", f"/databases/{DATABASE_ID}")
     title_property_name = get_title_property_name(database)
-    ensure_database_properties(database)
+    ensure_database_properties(database, DATABASE_ID, build_row_property_schemas())
 
     wbr_context = build_wbr_context(csv_path, csv_rows)
     print(
@@ -1354,6 +1522,15 @@ def main():
         f"window={wbr_context['window_start']} to {wbr_context['window_end']}, "
         f"source_file={wbr_context['source_file']}"
     )
+
+    review_page = None
+    if WBR_REVIEWS_DATABASE_ID:
+        print("Creating/updating WBR Review page...")
+        review_page = get_or_create_wbr_review_page(wbr_context, len(csv_rows))
+        if review_page:
+            wbr_context["review_page_id"] = review_page["id"]
+    else:
+        print("No WBR Reviews database secret found; rows will not be linked to a WBR Review page.")
 
     print("Syncing Notion pages...")
     created_count = 0
@@ -1374,20 +1551,44 @@ def main():
             created_count += 1
             print(f"  - Added {unique_row_key}")
 
-    print("Syncing week-on-week chart views...")
-    view_database = notion_request(
-        "GET",
-        f"/databases/{DATABASE_ID}",
-        headers=VIEW_HEADERS,
-    )
-    data_source_id = get_data_source_id(view_database)
-    created_charts, updated_charts = sync_chart_views(data_source_id, wbr_context)
+    created_charts = 0
+    updated_charts = 0
+    wbr_result = {
+        "latest_date": wbr_context["review_week"],
+        "previous_date": None,
+        "widgets_created": 0,
+        "widgets_updated": 0,
+    }
 
-    print("Syncing example WBR dashboard...")
-    wbr_result = sync_wbr_example_views(data_source_id, csv_rows)
+    if CREATE_NOTION_CHART_VIEWS:
+        try:
+            print("Syncing individual Notion chart views with expected and rolling-average lines...")
+            view_database = notion_request(
+                "GET",
+                f"/databases/{DATABASE_ID}",
+                headers=VIEW_HEADERS,
+            )
+            data_source_id = get_data_source_id(view_database)
+            created_charts, updated_charts = sync_chart_views(data_source_id, wbr_context)
+
+            print("Syncing WBR dashboard chart widgets...")
+            wbr_result = sync_wbr_example_views(data_source_id, csv_rows)
+        except Exception as chart_error:
+            if FAIL_ON_CHART_ERRORS:
+                raise
+
+            print("WARNING: Notion chart view sync failed, but row import succeeded.")
+            print(f"Chart error: {chart_error}")
+            print("The generated chart image will still be uploaded to the WBR Review page.")
+    else:
+        print("Skipping Notion chart views. Using generated chart image on the WBR Review page.")
 
     print("Generating and pushing layered WBR combo chart...")
-    combo_result = push_wbr_combo_chart_to_notion(csv_rows, title_property_name)
+    combo_result = push_wbr_combo_chart_to_notion(
+        csv_rows,
+        title_property_name,
+        review_page_id=wbr_context.get("review_page_id"),
+    )
     print(f"  - Uploaded combo chart to page: {combo_result['report_title']}")
     print(f"  - Local chart image: {combo_result['image_path']}")
 
