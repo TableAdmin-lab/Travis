@@ -19,7 +19,10 @@ jobs:
     env:
       NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      NOTION_WBR_REVIEWS_DATABASE_ID: ${{ secrets.NOTION_WBR_REVIEWS_DATABASE_ID }}
       NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+      CREATE_NOTION_CHART_VIEWS: "true"
+      FAIL_ON_CHART_ERRORS: "false"
 
     steps:
       - name: Check out repository
