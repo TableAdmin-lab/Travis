@@ -1,0 +1,44 @@
+name: Import CSV to Notion
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "data/incoming/*.csv"
+      - "import_to_notion.py"
+      - "requirements.txt"
+      - ".github/workflows/import-csv-to-notion.yml"
+
+jobs:
+  import-csv-to-notion:
+    runs-on: ubuntu-latest
+
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+      NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find latest CSV uploaded by Zapier
+        id: latest_csv
+        shell: bash
+        run: |
+          latest_file=$(ls -t data/incoming/*.csv | head -n 1)
+          echo "csv_path=$latest_file" >> "$GITHUB_OUTPUT"
+          echo "Latest CSV: $latest_file"
+
+      - name: Import latest CSV into Notion
+        env:
+          CSV_PATH: ${{ steps.latest_csv.outputs.csv_path }}
+        run: python import_to_notion.py
