@@ -729,6 +729,8 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
     expected_config = WBR_TARGETS.get(metric_name)
     expected_value = expected_config["value"] if expected_config else None
     average_value = summary["metrics"][metric_name].get("average")
+    current_value = summary["metrics"][metric_name].get("current")
+    previous_value = summary["metrics"][metric_name].get("previous")
 
     reference_values = [
         value
@@ -737,53 +739,148 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
     ]
 
     scale = 2
-    width, height = 1500 * scale, 900 * scale
-    margin = 55 * scale
-    plot_left = 160 * scale
-    plot_right = 1400 * scale
-    plot_top = 160 * scale
-    plot_bottom = 660 * scale
+    width, height = 1700 * scale, 1050 * scale
+    card_margin = 40 * scale
+    plot_left = 150 * scale
+    plot_right = 1580 * scale
+    plot_top = 405 * scale
+    plot_bottom = 790 * scale
     plot_width = plot_right - plot_left
     plot_height = plot_bottom - plot_top
 
     image = Image.new("RGBA", (width, height), (248, 250, 252, 255))
     draw = ImageDraw.Draw(image)
 
-    font_title = load_font(36 * scale, bold=True)
-    font_subtitle = load_font(22 * scale)
+    font_title = load_font(48 * scale, bold=True)
+    font_subtitle = load_font(24 * scale)
+    font_card_label = load_font(20 * scale, bold=True)
+    font_card_value = load_font(36 * scale, bold=True)
+    font_card_note = load_font(19 * scale)
     font_axis = load_font(22 * scale, bold=True)
     font_tick = load_font(20 * scale)
-    font_label = load_font(20 * scale, bold=True)
-    font_legend = load_font(21 * scale)
+    font_point_label = load_font(20 * scale, bold=True)
+    font_reference = load_font(18 * scale, bold=True)
+    font_footer = load_font(18 * scale)
 
     colors = {
+        "page": (248, 250, 252, 255),
         "card": (255, 255, 255, 255),
-        "grid": (223, 226, 230, 255),
-        "text": (31, 41, 55, 255),
-        "muted": (107, 114, 128, 255),
-        "series": (59, 130, 246, 255),
+        "border": (226, 232, 240, 255),
+        "grid": (226, 232, 240, 255),
+        "axis": (148, 163, 184, 255),
+        "text": (15, 23, 42, 255),
+        "muted": (100, 116, 139, 255),
+        "series": (37, 99, 235, 255),
         "bar": (96, 165, 250, 255),
-        "expected": (239, 68, 68, 255),
-        "average": (107, 114, 128, 255),
+        "expected": (220, 38, 38, 255),
+        "average": (71, 85, 105, 255),
+        "positive": (22, 163, 74, 255),
+        "negative": (220, 38, 38, 255),
+        "neutral": (100, 116, 139, 255),
     }
 
     draw.rounded_rectangle(
-        (margin, margin, width - margin, height - margin),
-        radius=22 * scale,
+        (card_margin, card_margin, width - card_margin, height - card_margin),
+        radius=28 * scale,
         fill=colors["card"],
-        outline=(226, 232, 240, 255),
+        outline=colors["border"],
         width=2 * scale,
     )
 
-    title = metric_name
-    subtitle = (
-        f"WBR {summary['latest_date']} | Rolling window "
-        f"{rows[0][DATE_FIELD]} to {rows[-1][DATE_FIELD]}"
+    latest_date = summary["latest_date"]
+    previous_date = summary["previous_date"]
+    window_start = rows[0][DATE_FIELD]
+    window_end = rows[-1][DATE_FIELD]
+
+    def value_text(value):
+        return metric_chart_value_label(metric_name, value)
+
+    def wow_text():
+        if current_value is None or previous_value is None:
+            return "n/a"
+        difference = current_value - previous_value
+        if metric_name in PERCENT_FIELDS:
+            return f"{difference * 100:+.1f} pp"
+        if previous_value == 0:
+            return f"{difference:+.2f}"
+        return f"{difference:+.2f} ({difference / previous_value:+.1%})"
+
+    def is_good_change():
+        if current_value is None or previous_value is None:
+            return None
+        # Lower is better for abandoned rate and time metrics.
+        lower_is_better = (
+            metric_name == "Abandoned Call Rate [%]"
+            or metric_name in (
+                "Average Call Hunting Time [min]",
+                "Average Call Handling Time [min]",
+            )
+        )
+        difference = current_value - previous_value
+        if difference == 0:
+            return None
+        return difference < 0 if lower_is_better else difference > 0
+
+    def status_text_and_color():
+        if expected_value is None or current_value is None:
+            return "No target", colors["neutral"]
+
+        lower_is_better = (
+            metric_name == "Abandoned Call Rate [%]"
+            or metric_name in (
+                "Average Call Hunting Time [min]",
+                "Average Call Handling Time [min]",
+            )
+        )
+
+        meets_target = current_value <= expected_value if lower_is_better else current_value >= expected_value
+        return ("On target", colors["positive"]) if meets_target else ("Off target", colors["negative"])
+
+    # Header
+    draw.text((88 * scale, 78 * scale), metric_name, font=font_title, fill=colors["text"])
+    subtitle = f"WBR {latest_date} | Rolling 8-week window: {window_start} to {window_end}"
+    draw.text((90 * scale, 136 * scale), subtitle, font=font_subtitle, fill=colors["muted"])
+
+    status_text, status_color = status_text_and_color()
+    status_bbox = draw.textbbox((0, 0), status_text, font=font_card_label)
+    status_width = status_bbox[2] - status_bbox[0] + 42 * scale
+    draw.rounded_rectangle(
+        (plot_right - status_width, 82 * scale, plot_right, 126 * scale),
+        radius=22 * scale,
+        fill=(240, 253, 244, 255) if status_color == colors["positive"] else (254, 242, 242, 255) if status_color == colors["negative"] else (241, 245, 249, 255),
+        outline=status_color,
+        width=2 * scale,
     )
+    draw.text((plot_right - status_width + 21 * scale, 95 * scale), status_text, font=font_card_label, fill=status_color)
 
-    draw.text((95 * scale, 85 * scale), title, font=font_title, fill=colors["text"])
-    draw.text((95 * scale, 130 * scale), subtitle, font=font_subtitle, fill=colors["muted"])
+    # KPI cards
+    card_top = 195 * scale
+    card_height = 120 * scale
+    card_gap = 22 * scale
+    card_width = (plot_right - plot_left - 3 * card_gap) / 4
+    card_xs = [plot_left + i * (card_width + card_gap) for i in range(4)]
 
+    kpi_cards = [
+        ("Current", value_text(current_value), f"Week ending {latest_date}", colors["series"]),
+        ("WoW change", wow_text(), f"Previous week {previous_date or 'n/a'}", colors["positive"] if is_good_change() is True else colors["negative"] if is_good_change() is False else colors["neutral"]),
+        ("Expected", value_text(expected_value) if expected_value is not None else "n/a", expected_config.get("label", "Target") if expected_config else "No configured target", colors["expected"]),
+        ("8-week avg", value_text(average_value), "Current rolling window", colors["average"]),
+    ]
+
+    for x, (label, value, note, accent) in zip(card_xs, kpi_cards):
+        draw.rounded_rectangle(
+            (x, card_top, x + card_width, card_top + card_height),
+            radius=18 * scale,
+            fill=(248, 250, 252, 255),
+            outline=colors["border"],
+            width=2 * scale,
+        )
+        draw.rectangle((x, card_top, x + 7 * scale, card_top + card_height), fill=accent)
+        draw.text((x + 24 * scale, card_top + 18 * scale), label.upper(), font=font_card_label, fill=colors["muted"])
+        draw.text((x + 24 * scale, card_top + 47 * scale), value, font=font_card_value, fill=accent)
+        draw.text((x + 24 * scale, card_top + 91 * scale), note, font=font_card_note, fill=colors["muted"])
+
+    # Chart scaling
     y_min = metric_chart_y_min(metric_name, display_values, reference_values)
     y_max = metric_chart_y_max(metric_name, display_values, reference_values)
     if y_max == y_min:
@@ -804,6 +901,15 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
             return f"{value:,.0f}"
         return f"{value:.1f}"
 
+    # Plot background
+    draw.rounded_rectangle(
+        (plot_left - 32 * scale, plot_top - 30 * scale, plot_right + 24 * scale, plot_bottom + 92 * scale),
+        radius=18 * scale,
+        fill=(255, 255, 255, 255),
+        outline=colors["border"],
+        width=1 * scale,
+    )
+
     # Grid and y labels
     for index in range(6):
         raw_value = y_min + (y_max - y_min) * index / 5
@@ -818,11 +924,11 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
             fill=colors["muted"],
         )
 
-    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=(156, 163, 175, 255), width=2 * scale)
-    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=(156, 163, 175, 255), width=2 * scale)
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=colors["axis"], width=2 * scale)
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=colors["axis"], width=2 * scale)
 
-    # Expected and average reference lines
-    def draw_reference_line(value, label, color, dash=18 * scale):
+    # Reference lines
+    def draw_reference_line(value, label, color, dash=16 * scale, y_offset=-20 * scale):
         if value is None:
             return
 
@@ -830,69 +936,70 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
         x = plot_left
         while x < plot_right:
             draw.line((x, y, min(x + dash, plot_right), y), fill=color, width=3 * scale)
-            x += dash * 1.8
+            x += dash * 1.75
 
-        label_text = f"{label}: {metric_chart_value_label(metric_name, value)}"
-        label_bbox = draw.textbbox((0, 0), label_text, font=font_label)
+        label_text = f"{label}: {value_text(value)}"
+        label_bbox = draw.textbbox((0, 0), label_text, font=font_reference)
         label_width = label_bbox[2] - label_bbox[0]
+        label_height = label_bbox[3] - label_bbox[1]
+        x0 = plot_right - label_width - 24 * scale
+        y0 = max(plot_top + 8 * scale, min(plot_bottom - 32 * scale, y + y_offset))
         draw.rounded_rectangle(
             (
-                plot_right - label_width - 24 * scale,
-                y - 28 * scale,
+                x0 - 10 * scale,
+                y0 - 6 * scale,
                 plot_right,
-                y - 3 * scale,
+                y0 + label_height + 8 * scale,
             ),
             radius=8 * scale,
-            fill=(255, 255, 255, 230),
+            fill=(255, 255, 255, 235),
+            outline=(226, 232, 240, 255),
+            width=1 * scale,
         )
-        draw.text(
-            (plot_right - label_width - 12 * scale, y - 27 * scale),
-            label_text,
-            font=font_label,
-            fill=color,
-        )
+        draw.text((x0, y0), label_text, font=font_reference, fill=color)
 
     if expected_config:
-        draw_reference_line(expected_value, expected_config.get("label", "Expected"), colors["expected"])
+        draw_reference_line(expected_value, "Expected", colors["expected"], dash=18 * scale, y_offset=10 * scale)
+    draw_reference_line(average_value, "8-week avg", colors["average"], dash=9 * scale, y_offset=-30 * scale)
 
-    draw_reference_line(average_value, "Rolling 8-week avg", colors["average"], dash=10 * scale)
-
-    # Main series: eligible calls as bars, everything else as line
+    # Main series
     if metric_name == "Eligible Calls [#]":
         slot = plot_width / max(len(dates), 1)
-        bar_width = min(90 * scale, slot * 0.62)
+        bar_width = min(110 * scale, slot * 0.62)
         for index, value in enumerate(display_values):
             x = x_at(index)
             y = y_at(value)
             draw.rounded_rectangle(
                 (x - bar_width / 2, y, x + bar_width / 2, plot_bottom),
-                radius=5 * scale,
+                radius=6 * scale,
                 fill=colors["bar"],
             )
-            label = metric_chart_value_label(metric_name, value)
-            label_bbox = draw.textbbox((0, 0), label, font=font_label)
+            label = value_text(value)
+            label_bbox = draw.textbbox((0, 0), label, font=font_point_label)
             draw.text(
-                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 28 * scale),
+                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 30 * scale),
                 label,
-                font=font_label,
+                font=font_point_label,
                 fill=colors["series"],
             )
     else:
         points = [(x_at(index), y_at(value)) for index, value in enumerate(display_values)]
         if len(points) > 1:
-            draw.line(points, fill=colors["series"], width=5 * scale, joint="curve")
+            draw.line(points, fill=colors["series"], width=6 * scale, joint="curve")
 
         for index, (x, y) in enumerate(points):
             draw.ellipse(
-                (x - 9 * scale, y - 9 * scale, x + 9 * scale, y + 9 * scale),
+                (x - 11 * scale, y - 11 * scale, x + 11 * scale, y + 11 * scale),
                 fill=colors["series"],
+                outline=(255, 255, 255, 255),
+                width=3 * scale,
             )
-            label = metric_chart_value_label(metric_name, display_values[index])
-            label_bbox = draw.textbbox((0, 0), label, font=font_label)
+            label = value_text(display_values[index])
+            label_bbox = draw.textbbox((0, 0), label, font=font_point_label)
             draw.text(
-                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 32 * scale),
+                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 38 * scale),
                 label,
-                font=font_label,
+                font=font_point_label,
                 fill=colors["series"],
             )
 
@@ -902,7 +1009,7 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
         text = date_label[5:] if len(date_label) >= 10 else date_label
         label_bbox = draw.textbbox((0, 0), text, font=font_tick)
         draw.text(
-            (x - (label_bbox[2] - label_bbox[0]) / 2, plot_bottom + 18 * scale),
+            (x - (label_bbox[2] - label_bbox[0]) / 2, plot_bottom + 20 * scale),
             text,
             font=font_tick,
             fill=colors["muted"],
@@ -910,40 +1017,42 @@ def render_wbr_metric_chart(csv_rows, metric_name, output_path):
 
     draw_centered_text(
         draw,
-        ((plot_left + plot_right) / 2, plot_bottom + 72 * scale),
-        DATE_FIELD,
+        ((plot_left + plot_right) / 2, plot_bottom + 65 * scale),
+        "Interaction week",
         font_axis,
         colors["text"],
     )
     draw_rotated_text(
         image,
-        (65 * scale, (plot_top + plot_bottom) / 2),
+        (70 * scale, (plot_top + plot_bottom) / 2),
         metric_chart_axis_label(metric_name),
         font_axis,
         colors["text"],
         90,
     )
 
-    # Legend
-    legend_y = 790 * scale
-    legend_x = 150 * scale
-    draw.line((legend_x, legend_y, legend_x + 38 * scale, legend_y), fill=colors["series"], width=5 * scale)
-    draw.text((legend_x + 52 * scale, legend_y - 14 * scale), metric_name, font=font_legend, fill=colors["text"])
+    # Footer / legend
+    legend_y = 930 * scale
+    legend_x = 115 * scale
+    draw.line((legend_x, legend_y, legend_x + 38 * scale, legend_y), fill=colors["series"], width=6 * scale)
+    draw.text((legend_x + 54 * scale, legend_y - 14 * scale), metric_name, font=font_footer, fill=colors["text"])
 
+    x = 640 * scale
     if expected_config:
-        x = 620 * scale
         draw.line((x, legend_y, x + 38 * scale, legend_y), fill=colors["expected"], width=4 * scale)
-        draw.text((x + 52 * scale, legend_y - 14 * scale), "Expected", font=font_legend, fill=colors["text"])
+        draw.text((x + 54 * scale, legend_y - 14 * scale), "Expected", font=font_footer, fill=colors["text"])
+        x += 300 * scale
 
-    x = 940 * scale
     draw.line((x, legend_y, x + 38 * scale, legend_y), fill=colors["average"], width=4 * scale)
-    draw.text((x + 52 * scale, legend_y - 14 * scale), "Rolling average", font=font_legend, fill=colors["text"])
+    draw.text((x + 54 * scale, legend_y - 14 * scale), "Rolling 8-week average", font=font_footer, fill=colors["text"])
+
+    footer = f"Generated from source data for WBR {latest_date}"
+    draw.text((115 * scale, 975 * scale), footer, font=font_footer, fill=colors["muted"])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image = image.convert("RGB").resize((width // scale, height // scale), Image.Resampling.LANCZOS)
     image.save(output_path, "PNG", optimize=True)
     return output_path
-
 
 def append_metric_chart_to_page(page_id, metric_name, file_upload_id):
     children = [
