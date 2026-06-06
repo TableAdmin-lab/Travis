@@ -23,8 +23,12 @@ WBR_REVIEWS_DATABASE_ID = (
 # Notion chart views via the Views API can be fragile while the data model is changing.
 # Default to generated chart images attached to each WBR Review page.
 # Set CREATE_NOTION_CHART_VIEWS=true if you want the script to also try Notion chart views.
-CREATE_NOTION_CHART_VIEWS = os.getenv("CREATE_NOTION_CHART_VIEWS", "true").lower() == "true"
+CREATE_NOTION_CHART_VIEWS = os.getenv("CREATE_NOTION_CHART_VIEWS", "false").lower() == "true"
 FAIL_ON_CHART_ERRORS = os.getenv("FAIL_ON_CHART_ERRORS", "false").lower() == "true"
+
+# If true, the script tries to create a linked database/dashboard view inside the WBR Review page
+# and then places the individual chart widgets there. This keeps charts with the review.
+CREATE_CHARTS_INSIDE_WBR_PAGE = os.getenv("CREATE_CHARTS_INSIDE_WBR_PAGE", "true").lower() == "true"
 
 # GitHub Actions will usually pass CSV_PATH explicitly.
 # If CSV_PATH is not set, the script will pick the newest CSV from CSV_GLOB.
@@ -37,6 +41,7 @@ WBR_VIEW_PREFIX = "WBR Test - "
 WBR_DASHBOARD_NAME = f"{WBR_VIEW_PREFIX}Overview"
 WBR_REPORT_TITLE_PREFIX = "WBR Combo Chart Test - "
 WBR_OUTPUT_DIR = Path("wbr_outputs")
+WBR_METRIC_CHART_OUTPUT_DIR = WBR_OUTPUT_DIR / "metric_charts"
 
 # Notion percent fields store values as fractions when the property is formatted
 # as percent, so 66.51% is sent as 0.6651 and displays as 66.51%.
@@ -636,6 +641,392 @@ def render_wbr_combo_chart(csv_rows, output_path):
     image = image.convert("RGB").resize((width // scale, height // scale), Image.Resampling.LANCZOS)
     image.save(output_path, "PNG", optimize=True)
     return output_path
+
+
+
+def metric_chart_value_label(metric_name, value):
+    if value is None:
+        return "n/a"
+
+    if metric_name in PERCENT_FIELDS:
+        return f"{value * 100:.1f}%"
+
+    if metric_name == "Eligible Calls [#]":
+        return f"{value:,.0f}"
+
+    return f"{value:.2f}"
+
+
+def metric_chart_axis_label(metric_name):
+    if metric_name in PERCENT_FIELDS:
+        return "Percent"
+
+    if metric_name == "Eligible Calls [#]":
+        return "Calls"
+
+    if "[min]" in metric_name:
+        return "Minutes"
+
+    return "Value"
+
+
+def metric_chart_y_max(metric_name, values, reference_values):
+    all_values = [
+        value
+        for value in [*values, *reference_values]
+        if value is not None
+    ]
+
+    if not all_values:
+        return 1
+
+    maximum = max(all_values)
+
+    if metric_name in PERCENT_FIELDS:
+        return max(1.0, maximum * 1.15)
+
+    return nice_axis_max(maximum * 1.15)
+
+
+def metric_chart_y_min(metric_name, values, reference_values):
+    if metric_name in PERCENT_FIELDS:
+        return 0
+
+    all_values = [
+        value
+        for value in [*values, *reference_values]
+        if value is not None
+    ]
+
+    if not all_values:
+        return 0
+
+    minimum = min(all_values)
+    return 0 if minimum >= 0 else minimum * 1.15
+
+
+def metric_chart_slug(metric_name):
+    return (
+        metric_name.lower()
+        .replace("[%]", "percent")
+        .replace("[#]", "count")
+        .replace("[min]", "min")
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("-", "_")
+        .replace("__", "_")
+        .strip("_")
+    )
+
+
+def render_wbr_metric_chart(csv_rows, metric_name, output_path):
+    rows = sorted_rows_by_date(csv_rows)
+    summary = build_wbr_metric_summary(csv_rows)
+    dates = [row[DATE_FIELD] for row in rows]
+    values = [parse_metric_value(row, metric_name) for row in rows]
+    display_values = [0 if value is None else value for value in values]
+
+    expected_config = WBR_TARGETS.get(metric_name)
+    expected_value = expected_config["value"] if expected_config else None
+    average_value = summary["metrics"][metric_name].get("average")
+
+    reference_values = [
+        value
+        for value in (expected_value, average_value)
+        if value is not None
+    ]
+
+    scale = 2
+    width, height = 1500 * scale, 900 * scale
+    margin = 55 * scale
+    plot_left = 160 * scale
+    plot_right = 1400 * scale
+    plot_top = 160 * scale
+    plot_bottom = 660 * scale
+    plot_width = plot_right - plot_left
+    plot_height = plot_bottom - plot_top
+
+    image = Image.new("RGBA", (width, height), (248, 250, 252, 255))
+    draw = ImageDraw.Draw(image)
+
+    font_title = load_font(36 * scale, bold=True)
+    font_subtitle = load_font(22 * scale)
+    font_axis = load_font(22 * scale, bold=True)
+    font_tick = load_font(20 * scale)
+    font_label = load_font(20 * scale, bold=True)
+    font_legend = load_font(21 * scale)
+
+    colors = {
+        "card": (255, 255, 255, 255),
+        "grid": (223, 226, 230, 255),
+        "text": (31, 41, 55, 255),
+        "muted": (107, 114, 128, 255),
+        "series": (59, 130, 246, 255),
+        "bar": (96, 165, 250, 255),
+        "expected": (239, 68, 68, 255),
+        "average": (107, 114, 128, 255),
+    }
+
+    draw.rounded_rectangle(
+        (margin, margin, width - margin, height - margin),
+        radius=22 * scale,
+        fill=colors["card"],
+        outline=(226, 232, 240, 255),
+        width=2 * scale,
+    )
+
+    title = metric_name
+    subtitle = (
+        f"WBR {summary['latest_date']} | Rolling window "
+        f"{rows[0][DATE_FIELD]} to {rows[-1][DATE_FIELD]}"
+    )
+
+    draw.text((95 * scale, 85 * scale), title, font=font_title, fill=colors["text"])
+    draw.text((95 * scale, 130 * scale), subtitle, font=font_subtitle, fill=colors["muted"])
+
+    y_min = metric_chart_y_min(metric_name, display_values, reference_values)
+    y_max = metric_chart_y_max(metric_name, display_values, reference_values)
+    if y_max == y_min:
+        y_max = y_min + 1
+
+    def x_at(index):
+        if len(dates) == 1:
+            return (plot_left + plot_right) / 2
+        return plot_left + (plot_width * index / (len(dates) - 1))
+
+    def y_at(value):
+        return plot_bottom - ((value - y_min) / (y_max - y_min)) * plot_height
+
+    def fmt_axis(value):
+        if metric_name in PERCENT_FIELDS:
+            return f"{value * 100:.0f}%"
+        if metric_name == "Eligible Calls [#]":
+            return f"{value:,.0f}"
+        return f"{value:.1f}"
+
+    # Grid and y labels
+    for index in range(6):
+        raw_value = y_min + (y_max - y_min) * index / 5
+        y = y_at(raw_value)
+        draw.line((plot_left, y, plot_right, y), fill=colors["grid"], width=2 * scale)
+        label = fmt_axis(raw_value)
+        label_bbox = draw.textbbox((0, 0), label, font=font_tick)
+        draw.text(
+            (plot_left - 22 * scale - (label_bbox[2] - label_bbox[0]), y - 12 * scale),
+            label,
+            font=font_tick,
+            fill=colors["muted"],
+        )
+
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=(156, 163, 175, 255), width=2 * scale)
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=(156, 163, 175, 255), width=2 * scale)
+
+    # Expected and average reference lines
+    def draw_reference_line(value, label, color, dash=18 * scale):
+        if value is None:
+            return
+
+        y = y_at(value)
+        x = plot_left
+        while x < plot_right:
+            draw.line((x, y, min(x + dash, plot_right), y), fill=color, width=3 * scale)
+            x += dash * 1.8
+
+        label_text = f"{label}: {metric_chart_value_label(metric_name, value)}"
+        label_bbox = draw.textbbox((0, 0), label_text, font=font_label)
+        label_width = label_bbox[2] - label_bbox[0]
+        draw.rounded_rectangle(
+            (
+                plot_right - label_width - 24 * scale,
+                y - 28 * scale,
+                plot_right,
+                y - 3 * scale,
+            ),
+            radius=8 * scale,
+            fill=(255, 255, 255, 230),
+        )
+        draw.text(
+            (plot_right - label_width - 12 * scale, y - 27 * scale),
+            label_text,
+            font=font_label,
+            fill=color,
+        )
+
+    if expected_config:
+        draw_reference_line(expected_value, expected_config.get("label", "Expected"), colors["expected"])
+
+    draw_reference_line(average_value, "Rolling 8-week avg", colors["average"], dash=10 * scale)
+
+    # Main series: eligible calls as bars, everything else as line
+    if metric_name == "Eligible Calls [#]":
+        slot = plot_width / max(len(dates), 1)
+        bar_width = min(90 * scale, slot * 0.62)
+        for index, value in enumerate(display_values):
+            x = x_at(index)
+            y = y_at(value)
+            draw.rounded_rectangle(
+                (x - bar_width / 2, y, x + bar_width / 2, plot_bottom),
+                radius=5 * scale,
+                fill=colors["bar"],
+            )
+            label = metric_chart_value_label(metric_name, value)
+            label_bbox = draw.textbbox((0, 0), label, font=font_label)
+            draw.text(
+                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 28 * scale),
+                label,
+                font=font_label,
+                fill=colors["series"],
+            )
+    else:
+        points = [(x_at(index), y_at(value)) for index, value in enumerate(display_values)]
+        if len(points) > 1:
+            draw.line(points, fill=colors["series"], width=5 * scale, joint="curve")
+
+        for index, (x, y) in enumerate(points):
+            draw.ellipse(
+                (x - 9 * scale, y - 9 * scale, x + 9 * scale, y + 9 * scale),
+                fill=colors["series"],
+            )
+            label = metric_chart_value_label(metric_name, display_values[index])
+            label_bbox = draw.textbbox((0, 0), label, font=font_label)
+            draw.text(
+                (x - (label_bbox[2] - label_bbox[0]) / 2, y - 32 * scale),
+                label,
+                font=font_label,
+                fill=colors["series"],
+            )
+
+    # X-axis labels
+    for index, date_label in enumerate(dates):
+        x = x_at(index)
+        text = date_label[5:] if len(date_label) >= 10 else date_label
+        label_bbox = draw.textbbox((0, 0), text, font=font_tick)
+        draw.text(
+            (x - (label_bbox[2] - label_bbox[0]) / 2, plot_bottom + 18 * scale),
+            text,
+            font=font_tick,
+            fill=colors["muted"],
+        )
+
+    draw_centered_text(
+        draw,
+        ((plot_left + plot_right) / 2, plot_bottom + 72 * scale),
+        DATE_FIELD,
+        font_axis,
+        colors["text"],
+    )
+    draw_rotated_text(
+        image,
+        (65 * scale, (plot_top + plot_bottom) / 2),
+        metric_chart_axis_label(metric_name),
+        font_axis,
+        colors["text"],
+        90,
+    )
+
+    # Legend
+    legend_y = 790 * scale
+    legend_x = 150 * scale
+    draw.line((legend_x, legend_y, legend_x + 38 * scale, legend_y), fill=colors["series"], width=5 * scale)
+    draw.text((legend_x + 52 * scale, legend_y - 14 * scale), metric_name, font=font_legend, fill=colors["text"])
+
+    if expected_config:
+        x = 620 * scale
+        draw.line((x, legend_y, x + 38 * scale, legend_y), fill=colors["expected"], width=4 * scale)
+        draw.text((x + 52 * scale, legend_y - 14 * scale), "Expected", font=font_legend, fill=colors["text"])
+
+    x = 940 * scale
+    draw.line((x, legend_y, x + 38 * scale, legend_y), fill=colors["average"], width=4 * scale)
+    draw.text((x + 52 * scale, legend_y - 14 * scale), "Rolling average", font=font_legend, fill=colors["text"])
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image = image.convert("RGB").resize((width // scale, height // scale), Image.Resampling.LANCZOS)
+    image.save(output_path, "PNG", optimize=True)
+    return output_path
+
+
+def append_metric_chart_to_page(page_id, metric_name, file_upload_id):
+    children = [
+        {
+            "type": "heading_3",
+            "heading_3": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": metric_name},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "image",
+            "image": {
+                "type": "file_upload",
+                "file_upload": {"id": file_upload_id},
+                "caption": [
+                    {
+                        "type": "text",
+                        "text": {"content": "Generated metric chart with expected and rolling-average reference lines."},
+                    }
+                ],
+            },
+        },
+    ]
+
+    notion_request(
+        "PATCH",
+        f"/blocks/{page_id}/children",
+        headers=VIEW_HEADERS,
+        json={"children": children},
+    )
+
+
+def push_individual_metric_charts_to_notion(csv_rows, page_id):
+    summary = build_wbr_metric_summary(csv_rows)
+    latest_date = summary["latest_date"]
+
+    notion_request(
+        "PATCH",
+        f"/blocks/{page_id}/children",
+        headers=VIEW_HEADERS,
+        json={
+            "children": [
+                {
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": f"Individual WBR Charts - {latest_date}"},
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+
+    uploaded = []
+
+    for metric_name in METRIC_FIELDS:
+        output_path = (
+            WBR_METRIC_CHART_OUTPUT_DIR
+            / latest_date
+            / f"{metric_chart_slug(metric_name)}.png"
+        )
+        render_wbr_metric_chart(csv_rows, metric_name, output_path)
+        upload = upload_file_to_notion(output_path)
+        append_metric_chart_to_page(page_id, metric_name, upload["id"])
+        uploaded.append(
+            {
+                "metric_name": metric_name,
+                "image_path": str(output_path),
+            }
+        )
+        print(f"  - Uploaded individual chart: {metric_name}")
+
+    return uploaded
+
 
 
 def build_page_properties(row, title_property_name, wbr_context):
@@ -1412,6 +1803,84 @@ def sync_chart_views(data_source_id, wbr_context):
     return created_count, updated_count
 
 
+def append_paragraph_to_page(page_id, text):
+    notion_request(
+        "PATCH",
+        f"/blocks/{page_id}/children",
+        headers=VIEW_HEADERS,
+        json={
+            "children": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": text},
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+
+
+def create_dashboard_view_on_wbr_page(data_source_id, review_page_id, dashboard_name):
+    """Create a linked database/dashboard view inside the WBR Review page.
+
+    Notion's Views API supports create_database for adding a linked database block to a page.
+    Because the exact create_database envelope has changed across API previews, this function
+    tries a few known-compatible payload shapes before giving up.
+    """
+    base_payload = {
+        "data_source_id": data_source_id,
+        "name": dashboard_name,
+        "type": "dashboard",
+    }
+
+    create_database_candidates = [
+        {"parent": {"type": "page_id", "page_id": review_page_id}},
+        {"parent": {"page_id": review_page_id}},
+        {"parent_page_id": review_page_id},
+        {"page_id": review_page_id},
+    ]
+
+    errors = []
+
+    for create_database_payload in create_database_candidates:
+        try:
+            payload = {
+                **base_payload,
+                "create_database": create_database_payload,
+            }
+            return create_view(payload)
+        except Exception as error:
+            errors.append(str(error))
+
+    raise RuntimeError(
+        "Could not create dashboard view inside the WBR Review page. "
+        "Tried multiple create_database payload shapes. Last errors:\n"
+        + "\n---\n".join(errors[-3:])
+    )
+
+
+def ensure_wbr_page_dashboard(data_source_id, existing_views_by_name, review_page_id, review_week):
+    dashboard_name = f"{WBR_VIEW_PREFIX}{review_week} - Charts"
+
+    existing_dashboard = existing_views_by_name.get(dashboard_name)
+    if existing_dashboard:
+        return existing_dashboard, False
+
+    dashboard = create_dashboard_view_on_wbr_page(
+        data_source_id,
+        review_page_id,
+        dashboard_name,
+    )
+    print(f"  - Created WBR page dashboard: {dashboard_name}")
+    return dashboard, True
+
+
 def ensure_wbr_dashboard(data_source_id, existing_views_by_name, review_week):
     dashboard_name = f"{WBR_VIEW_PREFIX}{review_week} - Overview"
     existing_dashboard = existing_views_by_name.get(dashboard_name)
@@ -1443,7 +1912,7 @@ def upsert_wbr_widget(payload, existing_views_by_name):
     return "created"
 
 
-def sync_wbr_example_views(data_source_id, csv_rows):
+def sync_wbr_example_views(data_source_id, csv_rows, review_page_id=None):
     data_source = retrieve_data_source(data_source_id)
     properties_by_name = data_source["properties"]
     missing_properties = [
@@ -1459,7 +1928,20 @@ def sync_wbr_example_views(data_source_id, csv_rows):
 
     summary = build_wbr_metric_summary(csv_rows)
     existing_views_by_name = get_existing_views_by_name(DATABASE_ID, data_source_id)
-    dashboard, dashboard_created = ensure_wbr_dashboard(data_source_id, existing_views_by_name, summary["latest_date"])
+    if CREATE_CHARTS_INSIDE_WBR_PAGE and review_page_id:
+        dashboard, dashboard_created = ensure_wbr_page_dashboard(
+            data_source_id,
+            existing_views_by_name,
+            review_page_id,
+            summary["latest_date"],
+        )
+    else:
+        dashboard, dashboard_created = ensure_wbr_dashboard(
+            data_source_id,
+            existing_views_by_name,
+            summary["latest_date"],
+        )
+
     existing_views_by_name[dashboard["name"]] = dashboard
 
     created_count = 0
@@ -1572,7 +2054,7 @@ def main():
             created_charts, updated_charts = sync_chart_views(data_source_id, wbr_context)
 
             print("Syncing WBR dashboard chart widgets...")
-            wbr_result = sync_wbr_example_views(data_source_id, csv_rows)
+            wbr_result = sync_wbr_example_views(data_source_id, csv_rows, wbr_context.get("review_page_id"))
         except Exception as chart_error:
             if FAIL_ON_CHART_ERRORS:
                 raise
@@ -1592,6 +2074,11 @@ def main():
     print(f"  - Uploaded combo chart to page: {combo_result['report_title']}")
     print(f"  - Local chart image: {combo_result['image_path']}")
 
+    chart_page_id = wbr_context.get("review_page_id") or combo_result["page_id"]
+    print("Generating and pushing individual WBR metric charts...")
+    individual_charts = push_individual_metric_charts_to_notion(csv_rows, chart_page_id)
+    print(f"  - Uploaded {len(individual_charts)} individual metric charts.")
+
     print(
         "\nDone. "
         f"Added {created_count} rows and updated {updated_count} rows in Notion. "
@@ -1600,7 +2087,7 @@ def main():
         f"vs {wbr_result['previous_date']}; "
         f"created {wbr_result['widgets_created']} WBR widgets and "
         f"updated {wbr_result['widgets_updated']} WBR widgets. "
-        f"Pushed layered combo chart to {combo_result['report_title']}."
+        f"Pushed layered combo chart and individual metric charts to {combo_result['report_title']}."
     )
 
 
