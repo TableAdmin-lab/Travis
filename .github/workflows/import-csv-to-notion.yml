@@ -3,7 +3,10 @@ name: Import CSV to Notion
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     paths:
+      - "data/incoming/**/*.csv"
       - "data/incoming/*.csv"
       - "import_to_notion.py"
       - "requirements.txt"
@@ -34,7 +37,11 @@ jobs:
         id: latest_csv
         shell: bash
         run: |
-          latest_file=$(ls -t data/incoming/*.csv | head -n 1)
+          latest_file=$(find data/incoming -type f -name "*.csv" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2-)
+          if [ -z "$latest_file" ]; then
+            echo "No CSV file found in data/incoming/"
+            exit 1
+          fi
           echo "csv_path=$latest_file" >> "$GITHUB_OUTPUT"
           echo "Latest CSV: $latest_file"
 
