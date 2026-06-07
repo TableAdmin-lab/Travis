@@ -6,11 +6,10 @@ on:
     branches:
       - main
     paths:
-      - "data/incoming/**/*.csv"
-      - "data/incoming/*.csv"
+      - "data/incoming/**"
       - "import_to_notion.py"
       - "requirements.txt"
-      - ".github/workflows/import-csv-to-notion.yml"
+      - ".github/workflows/**"
 
 jobs:
   import-csv-to-notion:
@@ -41,9 +40,10 @@ jobs:
         id: latest_csv
         shell: bash
         run: |
-          latest_file=$(find data/incoming -type f -name "*.csv" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2-)
+          latest_file=$(find data/incoming -type f -iname "*.csv" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2-)
           if [ -z "$latest_file" ]; then
             echo "No CSV file found in data/incoming/"
+            find data/incoming -maxdepth 5 -type f || true
             exit 1
           fi
           echo "csv_path=$latest_file" >> "$GITHUB_OUTPUT"
