@@ -29,26 +29,24 @@ jobs:
       - name: Show received report files
         run: |
           echo "Reporting week: ${{ inputs.week_id }}"
-          echo "Repo files:"
-          find . -maxdepth 4 -type f | sort
+          echo "Expected report directory:"
+          echo "data/incoming/${{ inputs.week_id }}"
+          echo ""
+          echo "Files in report directory:"
+          find "data/incoming/${{ inputs.week_id }}" -maxdepth 1 -type f | sort
 
       - name: Run WBR builder
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
 
           REPORTING_WEEK: ${{ inputs.week_id }}
           NEW_WBR_TITLE: WBR - ${{ inputs.week_id }}
 
           WBR_AUTOMATION_MODE: full
-
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           TEMPLATE_ITEM_TITLE: WBR Template
 
-          CSV_DIR: reports/${{ inputs.week_id }}
-
-          CSV_INBOUND_WEEKLY_PATH: reports/${{ inputs.week_id }}/first-line-inbound-weekly.csv
-          CSV_INBOUND_8_WEEK_PATH: reports/${{ inputs.week_id }}/first-line-inbound-8-week.csv
-          CSV_OUTBOUND_8_WEEK_PATH: reports/${{ inputs.week_id }}/first-line-outbound-8-week.csv
+          CSV_DIR: data/incoming/${{ inputs.week_id }}
 
         run: |
           python Build_WBR.py
