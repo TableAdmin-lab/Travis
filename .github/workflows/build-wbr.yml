@@ -1,31 +1,19 @@
-name: Import CSV to Notion
+name: Build WBR
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "data/incoming/**"
-      - "import_to_notion.py"
-      - "requirements.txt"
-      - ".github/workflows/**"
+    inputs:
+      week_id:
+        description: "Reporting week, for example 2026-06-08"
+        required: true
+        type: string
 
 jobs:
-  import-csv-to-notion:
+  build-wbr:
     runs-on: ubuntu-latest
 
-    env:
-      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-      NOTION_WBR_REVIEWS_DATABASE_ID: ${{ secrets.NOTION_WBR_REVIEWS_DATABASE_ID }}
-      NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
-      CREATE_NOTION_CHART_VIEWS: "false"
-      CREATE_CHARTS_INSIDE_WBR_PAGE: "false"
-      FAIL_ON_CHART_ERRORS: "false"
-
     steps:
-      - name: Check out repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -34,22 +22,33 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Find latest CSV uploaded by Zapier
-        id: latest_csv
-        shell: bash
         run: |
-          latest_file=$(find data/incoming -type f -iname "*.csv" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2-)
-          if [ -z "$latest_file" ]; then
-            echo "No CSV file found in data/incoming/"
-            find data/incoming -maxdepth 5 -type f || true
-            exit 1
-          fi
-          echo "csv_path=$latest_file" >> "$GITHUB_OUTPUT"
-          echo "Latest CSV: $latest_file"
+          python -m pip install --upgrade pip
+          pip install requests pillow
 
-      - name: Import latest CSV into Notion
+      - name: Show received report files
+        run: |
+          echo "Reporting week: ${{ inputs.week_id }}"
+          echo "Repo files:"
+          find . -maxdepth 4 -type f | sort
+
+      - name: Run WBR builder
         env:
-          CSV_PATH: ${{ steps.latest_csv.outputs.csv_path }}
-        run: python import_to_notion.py
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+
+          REPORTING_WEEK: ${{ inputs.week_id }}
+          NEW_WBR_TITLE: WBR - ${{ inputs.week_id }}
+
+          WBR_AUTOMATION_MODE: full
+
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TEMPLATE_ITEM_TITLE: WBR Template
+
+          CSV_DIR: reports/${{ inputs.week_id }}
+
+          CSV_INBOUND_WEEKLY_PATH: reports/${{ inputs.week_id }}/first-line-inbound-weekly.csv
+          CSV_INBOUND_8_WEEK_PATH: reports/${{ inputs.week_id }}/first-line-inbound-8-week.csv
+          CSV_OUTBOUND_8_WEEK_PATH: reports/${{ inputs.week_id }}/first-line-outbound-8-week.csv
+
+        run: |
+          python Build_WBR.py
