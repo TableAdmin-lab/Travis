@@ -1014,6 +1014,12 @@ def recover_missing_template_tail(source_page_id, target_page_id):
     first_missing_heading = None
 
     for heading in source_headings:
+        # Do not use old automated chart headings as a tail-recovery marker.
+        # The copy step intentionally skips old generated chart sections, so
+        # those headings are expected to be missing in the new WBR.
+        if "Automated First Line" in heading or AUTO_CHARTS_START in heading or AUTO_CHARTS_END in heading:
+            continue
+
         if heading not in target_heading_set:
             first_missing_heading = heading
             break
@@ -1215,7 +1221,18 @@ def clean_value(value):
     return "" if value is None else str(value).strip()
 
 
+
 def read_metrics_csv(csv_path):
+    """Read a Looker CSV and normalize its date column to DATE_FIELD.
+
+    The previous version only worked when DATE_FIELD appeared exactly in the
+    first five rows. This version:
+    - prints a small preview for debugging in GitHub Actions logs,
+    - finds the header row more defensively,
+    - accepts common date-field variants,
+    - aliases the detected date field back to DATE_FIELD so the chart code can
+      keep using one canonical name.
+    """
     csv_path = Path(csv_path)
 
     with csv_path.open(newline="", encoding="utf-8-sig") as file_handle:
@@ -1224,17 +1241,83 @@ def read_metrics_csv(csv_path):
     if not raw_rows:
         raise RuntimeError(f"CSV is empty: {csv_path}")
 
-    header_index = 0
-    for index, row in enumerate(raw_rows[:5]):
-        if DATE_FIELD in row:
-            header_index = index
+    print(f"Reading CSV: {csv_path}")
+    print(f"CSV size bytes: {csv_path.stat().st_size}")
+    print("CSV preview first 5 rows:")
+    for preview_row in raw_rows[:5]:
+        print(f"  {preview_row}")
+
+    possible_date_fields = [
+        DATE_FIELD,
+        "Interaction Date",
+        "Date",
+        "Created Date",
+        "Conversation Date",
+        "Chat Date",
+        "Call Date",
+        "Day",
+        "Week",
+    ]
+
+    def normalized(value):
+        return clean_value(value).lower()
+
+    possible_date_fields_lower = {field.lower() for field in possible_date_fields}
+
+    header_index = None
+    detected_date_field = None
+
+    # Prefer a header row with the canonical DATE_FIELD or a common equivalent.
+    for index, row in enumerate(raw_rows[:20]):
+        normalized_row = [normalized(cell) for cell in row]
+        for cell in row:
+            if normalized(cell) in possible_date_fields_lower:
+                header_index = index
+                detected_date_field = clean_value(cell)
+                break
+        if header_index is not None:
             break
+
+    # Fallback: find a header row containing any date-like column name.
+    if header_index is None:
+        for index, row in enumerate(raw_rows[:20]):
+            for cell in row:
+                cell_lower = normalized(cell)
+                if "date" in cell_lower or cell_lower in {"day", "week"}:
+                    header_index = index
+                    detected_date_field = clean_value(cell)
+                    break
+            if header_index is not None:
+                break
+
+    if header_index is None:
+        raise RuntimeError(
+            f"Could not detect a header row in CSV: {csv_path}\n"
+            f"Expected a date-like column such as {DATE_FIELD!r}.\n"
+            f"First 5 raw rows: {raw_rows[:5]}"
+        )
 
     headers = raw_rows[header_index]
     headers = [
         header if clean_value(header) else "__row_number"
         for header in headers
     ]
+
+    if detected_date_field not in headers:
+        # This should rarely happen, but avoids a confusing downstream error.
+        detected_date_field = None
+        for header in headers:
+            header_lower = header.lower()
+            if header_lower in possible_date_fields_lower or "date" in header_lower:
+                detected_date_field = header
+                break
+
+    if not detected_date_field:
+        raise RuntimeError(
+            f"Could not detect date column in CSV: {csv_path}\n"
+            f"Detected headers: {headers}\n"
+            f"First 5 raw rows: {raw_rows[:5]}"
+        )
 
     data_rows = []
     for raw_row in raw_rows[header_index + 1:]:
@@ -1247,16 +1330,74 @@ def read_metrics_csv(csv_path):
             for header, value in zip(headers, padded)
         }
 
-        if row.get(DATE_FIELD):
+        date_value = row.get(detected_date_field)
+        if date_value:
+            row[DATE_FIELD] = date_value
             data_rows.append(row)
 
     if not data_rows:
-        raise RuntimeError(f"No data rows found in CSV: {csv_path}")
+        raise RuntimeError(
+            f"No data rows found in CSV: {csv_path}\n"
+            f"Detected header row index: {header_index}\n"
+            f"Detected date field: {detected_date_field!r}\n"
+            f"Detected headers: {headers}\n"
+            f"First 10 raw rows: {raw_rows[:10]}"
+        )
 
     return sorted(data_rows, key=lambda row: row[DATE_FIELD])
 
 
+
+def find_csv_by_report_slug(report_slug, explicit_path=None):
+    """Find one CSV for an exact report slug in CSV_DIR.
+
+    Filenames look like:
+      first-line-inbound-8-week-2026-06-08T17-33-20-169Z-qoc4wc.csv
+
+    We intentionally match by slug prefix instead of loose keywords because the
+    date in the filename contains "8", which made the old keyword matcher choose
+    first-line-inbound-weekly for the inbound 8-week report.
+    """
+    if explicit_path:
+        path = Path(explicit_path)
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Explicit CSV path does not exist: {path}")
+
+    search_root = CSV_DIR
+
+    if not search_root.exists():
+        raise FileNotFoundError(f"CSV_DIR does not exist: {search_root}")
+
+    report_slug = report_slug.lower().strip()
+    candidates = []
+
+    for path in search_root.glob("*.csv"):
+        name = path.name.lower()
+        stem = path.stem.lower()
+
+        if stem == report_slug or name.startswith(f"{report_slug}-"):
+            candidates.append(path)
+
+    if not candidates:
+        available = "\n".join(sorted(p.name for p in search_root.glob("*.csv")))
+        raise FileNotFoundError(
+            f"Could not find CSV for report slug: {report_slug}\n"
+            f"CSV_DIR: {search_root}\n"
+            f"Available CSVs:\n{available}"
+        )
+
+    selected = max(candidates, key=lambda path: path.stat().st_mtime)
+    print(f"Selected CSV for {report_slug}: {selected}")
+    return selected
+
+
 def find_csv_by_keywords(keywords, explicit_path=None):
+    """Backward-compatible wrapper.
+
+    New automation code should use find_csv_by_report_slug. This fallback remains
+    for older local runs, but exact report slug matching is safer.
+    """
     if explicit_path:
         path = Path(explicit_path)
         if path.exists():
@@ -2201,20 +2342,20 @@ def generate_and_insert_first_line_charts(page_id):
 
     cleanup_existing_first_line_auto_charts(page_id)
 
-    inbound_weekly_csv = find_csv_by_keywords(
-        ["inbound", "weekly"],
+    inbound_weekly_csv = find_csv_by_report_slug(
+        "first-line-inbound-weekly",
         explicit_path=CSV_INBOUND_WEEKLY_PATH,
     )
-    inbound_8_week_csv = find_csv_by_keywords(
-        ["inbound", "8"],
+    inbound_8_week_csv = find_csv_by_report_slug(
+        "first-line-inbound-8-week",
         explicit_path=CSV_INBOUND_8_WEEK_PATH,
     )
-    outbound_8_week_csv = find_csv_by_keywords(
-        ["outbound", "8"],
+    outbound_8_week_csv = find_csv_by_report_slug(
+        "first-line-outbound-8-week",
         explicit_path=CSV_OUTBOUND_8_WEEK_PATH,
     )
-    chats_csv = find_csv_by_keywords(
-        ["chats"],
+    chats_csv = find_csv_by_report_slug(
+        "first-line-chats",
         explicit_path=CSV_CHATS_PATH,
     )
 
