@@ -35,6 +35,17 @@ jobs:
           echo "Files in report directory:"
           find "data/incoming/${{ inputs.week_id }}" -maxdepth 1 -type f | sort
 
+      - name: Validate required reports exist
+        run: |
+          REPORT_DIR="data/incoming/${{ inputs.week_id }}"
+
+          test -d "$REPORT_DIR"
+
+          ls "$REPORT_DIR"/*first-line-inbound-weekly*.csv
+          ls "$REPORT_DIR"/*first-line-inbound-8-week*.csv
+          ls "$REPORT_DIR"/*first-line-outbound-8-week*.csv
+          ls "$REPORT_DIR"/*first-line-chats*.csv
+
       - name: Run WBR builder
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -47,6 +58,12 @@ jobs:
           TEMPLATE_ITEM_TITLE: WBR Template
 
           CSV_DIR: data/incoming/${{ inputs.week_id }}
+
+          TARGET_HEADING: "17.7 First Line Support"
+          TARGET_INBOUND_WEEKLY_ANCHOR_TEXT: "New Daily 1 Week View"
+          TARGET_INBOUND_8_WEEK_ANCHOR_TEXT: "Inbound"
+          TARGET_OUTBOUND_8_WEEK_ANCHOR_TEXT: "Outbound"
+          TARGET_CHATS_ANCHOR_TEXT: "Chats"
 
         run: |
           python Build_WBR.py
