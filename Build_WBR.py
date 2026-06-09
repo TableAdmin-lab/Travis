@@ -64,7 +64,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-section-17-8-copy-fix-v7"
+BUILD_WBR_VERSION = "2026-06-09-two-chat-graphs-v8"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -2286,7 +2286,7 @@ def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_we
     ]
     chat_chart_specs = [
         spec for spec in chart_specs
-        if spec["key"] == "chats"
+        if spec["key"] in {"agent_chats", "bot_chats"}
     ]
 
     # 17.7 is First Line Calls. Insert the call charts there.
@@ -2369,34 +2369,8 @@ def find_first_available_field(rows, exact_candidates=None, keyword_groups=None)
     return None
 
 
-def choose_chat_fields(rows):
-    """Pick chat fields in the same shape as the manual Looker chat examples.
-
-    Expected examples:
-    - bar: Agent/Eligible chats
-    - lines: AI CSAT Chat, AI CSAT Chat Participation Rate, CSAT Chat,
-      CSAT Chat Participation
-    """
-    count_field = find_first_available_field(
-        rows,
-        exact_candidates=[
-            os.getenv("CHAT_COUNT_FIELD", ""),
-            "Eligible Chats [#]",
-            "Agent Handled Chats [#]",
-            "Total Chats [#]",
-            "Chats [#]",
-            "Conversations [#]",
-            "Solved Chats [#]",
-        ],
-        keyword_groups=[
-            ["agent", "handled", "chat", "#"],
-            ["eligible", "chat", "#"],
-            ["total", "chat", "#"],
-            ["chat", "#"],
-            ["conversation", "#"],
-        ],
-    )
-
+def choose_chat_percent_fields(rows):
+    """Return chat percentage lines in the order used by the Looker examples."""
     ordered_percent_candidates = [
         os.getenv("CHAT_AI_CSAT_FIELD", ""),
         "AI CSAT Chat [%]",
@@ -2440,242 +2414,95 @@ def choose_chat_fields(rows):
             percent_fields.append(field)
             seen.add(field)
 
+    return percent_fields
+
+
+def choose_agent_chat_fields(rows):
+    count_field = find_first_available_field(
+        rows,
+        exact_candidates=[
+            os.getenv("AGENT_CHAT_COUNT_FIELD", ""),
+            os.getenv("CHAT_COUNT_FIELD", ""),
+            "Agent Handled Chats [#]",
+            "Eligible Chats [#]",
+            "Total Chats [#]",
+            "Chats [#]",
+            "Conversations [#]",
+            "Solved Chats [#]",
+        ],
+        keyword_groups=[
+            ["agent", "handled", "chat", "#"],
+            ["eligible", "chat", "#"],
+            ["total", "chat", "#"],
+            ["chat", "#"],
+            ["conversation", "#"],
+        ],
+    )
+
+    percent_fields = choose_chat_percent_fields(rows)
+
     if not count_field and not percent_fields:
         raise RuntimeError(
-            "Could not identify chat metrics in the chats CSV. Available fields were: "
+            "Could not identify agent chat metrics in the chats CSV. Available fields were: "
             + ", ".join(available_csv_fields(rows))
-            + ". Set CHAT_COUNT_FIELD / CHAT_AI_CSAT_FIELD / CHAT_AI_CSAT_PARTICIPATION_FIELD / CHAT_CSAT_FIELD / CHAT_CSAT_PARTICIPATION_FIELD in the workflow if needed."
+            + ". Set AGENT_CHAT_COUNT_FIELD / CHAT_* env vars in the workflow if needed."
         )
 
     return count_field, percent_fields
 
 
-def render_generic_support_chart(rows, title, output_path, count_field=None, percent_fields=None):
-    dates = [row[DATE_FIELD] for row in rows]
-    percent_fields = percent_fields or []
-
-    count_values = []
-    if count_field:
-        count_values = [value or 0 for value in numeric_series_for_field(rows, count_field)]
-
-    percent_values_by_field = {
-        field: percent_series_for_field(rows, field)
-        for field in percent_fields
-    }
-
-    scale = 2
-    width, height = 1750 * scale, 980 * scale
-    plot_left = 215 * scale
-    plot_right = 1505 * scale
-    plot_top = 140 * scale
-    plot_bottom = 670 * scale
-    plot_width = plot_right - plot_left
-    plot_height = plot_bottom - plot_top
-
-    image = Image.new("RGBA", (width, height), (255, 255, 255, 255))
-    draw = ImageDraw.Draw(image)
-
-    font_title = load_font(38 * scale, bold=True)
-    font_axis = load_font(24 * scale, bold=True)
-    font_tick = load_font(22 * scale)
-    font_label = load_font(21 * scale, bold=True)
-    font_legend = load_font(21 * scale)
-
-    colors = {
-        "text": (44, 52, 62, 255),
-        "grid": (224, 226, 228, 255),
-        "axis": (164, 170, 179, 255),
-        "label_bg": (255, 255, 255, 225),
-        "count": (94, 196, 222, 255),
-        "line_1": (111, 154, 148, 255),
-        "line_2": (255, 137, 110, 255),
-        "line_3": (255, 194, 110, 255),
-        "line_4": (130, 116, 198, 255),
-    }
-
-    draw_centered_text(draw, (width / 2, 58 * scale), title, font_title, colors["text"])
-
-    max_count = max(count_values) if count_values else 1
-    left_axis_max = nice_axis_max(max_count * 1.16)
-
-    all_percent_values = [
-        value
-        for values in percent_values_by_field.values()
-        for value in values
-        if value is not None
-    ]
-    max_percent = max(all_percent_values) if all_percent_values else 1.0
-    right_axis_max = 1.0 if max_percent <= 1.0 else min(1.15, math.ceil(max_percent * 10) / 10)
-
-    side_padding = 78 * scale
-
-    def x_at(index):
-        if len(dates) == 1:
-            return (plot_left + plot_right) / 2
-        usable_width = plot_width - (2 * side_padding)
-        return plot_left + side_padding + (usable_width * index / (len(dates) - 1))
-
-    def y_left(value):
-        return plot_bottom - (value / left_axis_max) * plot_height
-
-    def y_right(value):
-        return plot_bottom - (value / right_axis_max) * plot_height
-
-    def draw_value_label(text, center_x, center_y, font, fill):
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-
-        label_x = center_x - text_width / 2
-        label_y = center_y - text_height / 2
-
-        label_x = max(plot_left + 4 * scale, min(plot_right - text_width - 4 * scale, label_x))
-        label_y = max(plot_top + 4 * scale, min(plot_bottom - text_height - 4 * scale, label_y))
-
-        draw.rounded_rectangle(
-            (
-                label_x - 4 * scale,
-                label_y - 3 * scale,
-                label_x + text_width + 4 * scale,
-                label_y + text_height + 5 * scale,
-            ),
-            radius=4 * scale,
-            fill=colors["label_bg"],
-        )
-        draw.text((label_x, label_y), text, font=font, fill=fill)
-
-    for index in range(6):
-        tick = left_axis_max * index / 5
-        y = y_left(tick)
-        draw.line((plot_left, y, plot_right, y), fill=colors["grid"], width=2 * scale)
-        label = format_count(tick)
-        bbox = draw.textbbox((0, 0), label, font=font_tick)
-        draw.text(
-            (plot_left - 24 * scale - (bbox[2] - bbox[0]), y - 13 * scale),
-            label,
-            font=font_tick,
-            fill=colors["text"],
-        )
-
-    for index in range(6):
-        pct = right_axis_max * index / 5
-        y = y_right(pct)
-        label = f"{pct * 100:.0f}%"
-        draw.text((plot_right + 24 * scale, y - 13 * scale), label, font=font_tick, fill=colors["text"])
-
-    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=colors["axis"], width=2 * scale)
-    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=colors["axis"], width=2 * scale)
-    draw.line((plot_right, plot_top, plot_right, plot_bottom), fill=colors["axis"], width=2 * scale)
-
-    if count_field:
-        slot = (plot_width - 2 * side_padding) / max(len(dates) - 1, 1)
-        bar_width = min(92 * scale, slot * 0.58)
-        for index, value in enumerate(count_values):
-            x = x_at(index)
-            y = y_left(value)
-            draw.rounded_rectangle(
-                (x - bar_width / 2, y, x + bar_width / 2, plot_bottom),
-                radius=4 * scale,
-                fill=colors["count"],
-            )
-            draw_value_label(format_count(value), x, y - 18 * scale, font_label, colors["count"])
-
-    line_colors = [colors["line_1"], colors["line_2"], colors["line_3"], colors["line_4"]]
-
-    for field_index, (field, values) in enumerate(percent_values_by_field.items()):
-        color = line_colors[field_index % len(line_colors)]
-        points = []
-        for index, value in enumerate(values):
-            if value is None:
-                continue
-            points.append((x_at(index), y_right(value), value, index))
-
-        if len(points) >= 2:
-            draw.line([(x, y) for x, y, _, _ in points], fill=color, width=4 * scale)
-
-        for x, y, value, index in points:
-            draw.ellipse((x - 7 * scale, y - 7 * scale, x + 7 * scale, y + 7 * scale), fill=color)
-            draw_value_label(
-                format_percent(value),
-                x,
-                y - (26 + field_index * 22) * scale,
-                font_label,
-                color,
-            )
-
-    for index, date_label in enumerate(dates):
-        x = x_at(index)
-        display_date = date_label[5:] if len(date_label) >= 10 else date_label
-        bbox = draw.textbbox((0, 0), display_date, font=font_tick)
-        draw.text(
-            (x - (bbox[2] - bbox[0]) / 2, plot_bottom + 22 * scale),
-            display_date,
-            font=font_tick,
-            fill=colors["text"],
-        )
-
-    draw_centered_text(
-        draw,
-        ((plot_left + plot_right) / 2, plot_bottom + 72 * scale),
-        DATE_FIELD,
-        font_axis,
-        colors["text"],
+def choose_bot_chat_fields(rows):
+    count_field = find_first_available_field(
+        rows,
+        exact_candidates=[
+            os.getenv("BOT_CHAT_COUNT_FIELD", ""),
+            "Bot Handled Chats [#]",
+            "Bot Chats [#]",
+            "Bot Conversations [#]",
+            "Automation Handled Chats [#]",
+        ],
+        keyword_groups=[
+            ["bot", "handled", "chat", "#"],
+            ["bot", "chat", "#"],
+            ["bot", "conversation", "#"],
+            ["automation", "chat", "#"],
+        ],
     )
 
-    left_axis_label = count_field or "Count"
-    draw_rotated_text(
-        image,
-        (58 * scale, (plot_top + plot_bottom) / 2),
-        left_axis_label,
-        font_axis,
-        colors["count"],
-        90,
-    )
-    draw_rotated_text(
-        image,
-        (1680 * scale, (plot_top + plot_bottom) / 2),
-        "[%]",
-        font_axis,
-        colors["text"],
-        90,
-    )
+    percent_fields = choose_chat_percent_fields(rows)
 
-    legend_items = []
-    if count_field:
-        legend_items.append((count_field, colors["count"]))
-    for field_index, field in enumerate(percent_values_by_field.keys()):
-        legend_items.append((field, line_colors[field_index % len(line_colors)]))
+    if not count_field:
+        raise RuntimeError(
+            "Could not identify bot chat count field in the chats CSV. Available fields were: "
+            + ", ".join(available_csv_fields(rows))
+            + ". Set BOT_CHAT_COUNT_FIELD in the workflow if needed."
+        )
 
-    legend_y = 850 * scale
-    legend_total_width = 0
-    for text, _ in legend_items:
-        bbox = draw.textbbox((0, 0), text, font=font_legend)
-        legend_total_width += 38 * scale + (bbox[2] - bbox[0]) + 32 * scale
-
-    legend_x = max(60 * scale, (width - legend_total_width) / 2)
-    for text, color in legend_items:
-        draw.ellipse((legend_x, legend_y - 8 * scale, legend_x + 16 * scale, legend_y + 8 * scale), fill=color)
-        draw.text((legend_x + 24 * scale, legend_y - 13 * scale), text, font=font_legend, fill=colors["text"])
-        bbox = draw.textbbox((0, 0), text, font=font_legend)
-        legend_x += 38 * scale + (bbox[2] - bbox[0]) + 32 * scale
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image = image.convert("RGB").resize((width // scale, height // scale), Image.Resampling.LANCZOS)
-    image.save(output_path, "PNG", optimize=True)
-    return output_path
+    return count_field, percent_fields
 
 
-def render_chat_chart(rows, output_path):
-    count_field, percent_fields = choose_chat_fields(rows)
-    print(f"Chat count field: {count_field}")
-    print(f"Chat percent fields: {percent_fields}")
+def render_chat_chart(rows, output_path, chart_kind):
+    if chart_kind == "agent":
+        count_field, percent_fields = choose_agent_chat_fields(rows)
+        title = "Agent Chat Metrics - CSAT"
+        print(f"Agent chat count field: {count_field}")
+        print(f"Agent chat percent fields: {percent_fields}")
+    elif chart_kind == "bot":
+        count_field, percent_fields = choose_bot_chat_fields(rows)
+        title = "Bot Chat Metrics - CSAT"
+        print(f"Bot chat count field: {count_field}")
+        print(f"Bot chat percent fields: {percent_fields}")
+    else:
+        raise RuntimeError(f"Unknown chat chart kind: {chart_kind}")
+
     return render_generic_support_chart(
         rows=rows,
-        title="Chats",
+        title=title,
         output_path=output_path,
         count_field=count_field,
         percent_fields=percent_fields,
     )
+
 
 def generate_and_insert_first_line_charts(page_id):
     print()
@@ -2753,13 +2580,22 @@ def generate_and_insert_first_line_charts(page_id):
             "caption": "First Line Support outbound call metrics — 8-week rolling window.",
         },
         {
-            "key": "chats",
-            "title": "Chats",
+            "key": "agent_chats",
+            "title": "Agent Chat Metrics - CSAT",
             "anchor_text": TARGET_CHATS_ANCHOR_TEXT,
             "rows": chats_rows,
-            "renderer": "chat",
-            "output_name": "first_line_chats.png",
-            "caption": "First Line Support chat metrics.",
+            "renderer": "chat_agent",
+            "output_name": "first_line_agent_chats.png",
+            "caption": "First Line Support agent chat metrics.",
+        },
+        {
+            "key": "bot_chats",
+            "title": "Bot Chat Metrics - CSAT",
+            "anchor_text": TARGET_CHATS_ANCHOR_TEXT,
+            "rows": chats_rows,
+            "renderer": "chat_bot",
+            "output_name": "first_line_bot_chats.png",
+            "caption": "First Line Support bot chat metrics.",
         },
     ]
 
@@ -2768,10 +2604,17 @@ def generate_and_insert_first_line_charts(page_id):
     for chart in chart_specs:
         output_path = OUTPUT_DIR / review_week / chart["output_name"]
 
-        if chart["renderer"] == "chat":
+        if chart["renderer"] == "chat_agent":
             render_chat_chart(
                 rows=chart["rows"],
                 output_path=output_path,
+                chart_kind="agent",
+            )
+        elif chart["renderer"] == "chat_bot":
+            render_chat_chart(
+                rows=chart["rows"],
+                output_path=output_path,
+                chart_kind="bot",
             )
         else:
             render_combined_call_chart(
