@@ -63,7 +63,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-tail-chat-fix-v5"
+BUILD_WBR_VERSION = "2026-06-09-section-17-8-no-markers-v6"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -99,6 +99,7 @@ CSV_OUTBOUND_8_WEEK_PATH = os.getenv("CSV_OUTBOUND_8_WEEK_PATH")
 CSV_CHATS_PATH = os.getenv("CSV_CHATS_PATH")
 
 TARGET_HEADING = os.getenv("TARGET_HEADING", "17.7 First Line Support")
+TARGET_CHATS_HEADING = os.getenv("TARGET_CHATS_HEADING", "17.8")
 # Default anchors expected inside the First Line Support section. Override these
 # in GitHub Actions if the exact Notion template text is different.
 TARGET_INBOUND_WEEKLY_ANCHOR_TEXT = os.getenv("TARGET_INBOUND_WEEKLY_ANCHOR_TEXT", "New Daily 1 Week View")
@@ -2020,19 +2021,12 @@ def append_single_first_line_chart(page_id, after_block, chart, review_week):
 
 
 def build_chart_blocks(chart, review_week):
-    """Build the marker, heading, image, and end marker blocks for one chart."""
-    start_marker = f"{AUTO_CHARTS_START}_{chart['key']}"
-    end_marker = f"{AUTO_CHARTS_END}_{chart['key']}"
+    """Build only visible chart blocks.
 
+    We intentionally do not add AUTO_CHARTS marker paragraphs. The user-facing
+    WBR should only show the chart heading and chart image.
+    """
     return [
-        {
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": start_marker}}
-                ]
-            },
-        },
         {
             "type": "heading_3",
             "heading_3": {
@@ -2045,14 +2039,6 @@ def build_chart_blocks(chart, review_week):
             },
         },
         image_block_from_uploaded_chart(chart),
-        {
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": end_marker}}
-                ]
-            },
-        },
     ]
 
 
@@ -2076,21 +2062,47 @@ def append_chart_group_after_anchor(page_id, after_block, charts, review_week):
     )
 
 
-def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_week):
-    uploaded_by_key = {chart["key"]: chart for chart in uploaded_charts}
 
+def find_heading_block(page_id, heading_contains):
+    """Find a heading block by text, including nested blocks."""
+    blocks = flatten_blocks_recursive(page_id, max_depth=MAX_COPY_DEPTH + 3)
+    needle = str(heading_contains or "").lower().strip()
+
+    for block in blocks:
+        text = block_plain_text(block)
+        if heading_level(block) is not None and needle in text.lower():
+            print(f"Found heading for {heading_contains!r}: {text!r}")
+            print(f"Heading block ID: {block['id']}")
+            return block
+
+    return None
+
+
+def append_chart_group_after_heading(page_id, heading_block, charts, review_week):
+    """Append charts immediately after a heading block."""
+    parent_id = get_append_parent_id(page_id, heading_block)
+
+    children = []
+    for chart in charts:
+        children.extend(build_chart_blocks(chart, review_week))
+
+    return notion_request(
+        "PATCH",
+        f"/blocks/{parent_id}/children",
+        json={"after": heading_block["id"], "children": children},
+    )
+
+
+def first_available_anchor(page_id, heading_contains, chart_specs):
+    """Find the first available anchor for a group of chart specs."""
     anchors_by_key = {}
     missing_specs = []
 
-    # First pass: find all original anchors before inserting anything.
-    # This prevents newly inserted AUTO_CHARTS blocks from being matched as anchors
-    # for later charts.
     for spec in chart_specs:
-        anchor_text = spec["anchor_text"]
         anchor_block = find_block_after_heading(
             page_id=page_id,
-            heading_contains=TARGET_HEADING,
-            target_text=anchor_text,
+            heading_contains=heading_contains,
+            target_text=spec["anchor_text"],
         )
 
         if anchor_block:
@@ -2098,59 +2110,101 @@ def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_we
         else:
             missing_specs.append(spec)
 
-    # If all anchors exist, insert each chart after its matching anchor.
-    if not missing_specs:
-        for spec in chart_specs:
-            chart = uploaded_by_key[spec["key"]]
-            anchor_block = anchors_by_key[spec["key"]]
+    preferred = anchors_by_key.get(chart_specs[0]["key"])
+    fallback = preferred or (next(iter(anchors_by_key.values())) if anchors_by_key else None)
 
-            append_single_first_line_chart(
-                page_id=page_id,
-                after_block=anchor_block,
-                chart=chart,
-                review_week=review_week,
-            )
+    return fallback, anchors_by_key, missing_specs
 
-            print(f"Inserted chart {chart['title']!r} after anchor {spec['anchor_text']!r}.")
 
-        return
+def append_chart_group_to_section(page_id, heading_contains, chart_specs, uploaded_by_key, review_week):
+    """Insert a group of charts into one WBR section.
 
-    print(
-        "Some First Line Support anchors were not found: "
-        + ", ".join(spec["anchor_text"] for spec in missing_specs)
-    )
-    print(
-        "Falling back to inserting all First Line Support charts as one group "
-        "after the first available First Line Support anchor."
-    )
-
-    # Prefer the explicit 1-week anchor, since this is the one present in the
-    # current template. If not available, use the first anchor found.
-    fallback_anchor = anchors_by_key.get("inbound_weekly")
-
-    if not fallback_anchor and anchors_by_key:
-        fallback_anchor = next(iter(anchors_by_key.values()))
-
-    if not fallback_anchor:
-        raise RuntimeError(
-            "Could not find any First Line Support chart anchor. "
-            f"Expected heading containing {TARGET_HEADING!r} and at least one of: "
-            + ", ".join(spec["anchor_text"] for spec in chart_specs)
-            + ". If the template uses different wording, set the matching TARGET_*_ANCHOR_TEXT env var."
-        )
-
+    If the section has a matching anchor, insert after that anchor. If not,
+    insert after the section heading itself.
+    """
     charts_in_order = [uploaded_by_key[spec["key"]] for spec in chart_specs]
 
-    append_chart_group_after_anchor(
+    fallback_anchor, anchors_by_key, missing_specs = first_available_anchor(
         page_id=page_id,
-        after_block=fallback_anchor,
-        charts=charts_in_order,
+        heading_contains=heading_contains,
+        chart_specs=chart_specs,
+    )
+
+    if fallback_anchor:
+        if missing_specs:
+            print(
+                f"Some anchors under {heading_contains!r} were not found: "
+                + ", ".join(spec["anchor_text"] for spec in missing_specs)
+            )
+            print(
+                "Inserting this chart group after the first available anchor: "
+                f"{block_plain_text(fallback_anchor)!r}"
+            )
+
+        append_chart_group_after_anchor(
+            page_id=page_id,
+            after_block=fallback_anchor,
+            charts=charts_in_order,
+            review_week=review_week,
+        )
+        print(
+            f"Inserted {len(charts_in_order)} chart(s) under {heading_contains!r} "
+            f"after anchor {block_plain_text(fallback_anchor)!r}."
+        )
+        return
+
+    heading_block = find_heading_block(page_id, heading_contains)
+    if heading_block:
+        print(
+            f"No anchors found under {heading_contains!r}. "
+            "Inserting chart group directly after the section heading."
+        )
+        append_chart_group_after_heading(
+            page_id=page_id,
+            heading_block=heading_block,
+            charts=charts_in_order,
+            review_week=review_week,
+        )
+        print(
+            f"Inserted {len(charts_in_order)} chart(s) directly after heading "
+            f"{block_plain_text(heading_block)!r}."
+        )
+        return
+
+    raise RuntimeError(
+        f"Could not find section heading or anchor for {heading_contains!r}. "
+        "Update TARGET_HEADING / TARGET_CHATS_HEADING or the relevant TARGET_*_ANCHOR_TEXT env var."
+    )
+
+
+def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_week):
+    uploaded_by_key = {chart["key"]: chart for chart in uploaded_charts}
+
+    call_chart_specs = [
+        spec for spec in chart_specs
+        if spec["key"] in {"inbound_weekly", "inbound_8_week", "outbound_8_week"}
+    ]
+    chat_chart_specs = [
+        spec for spec in chart_specs
+        if spec["key"] == "chats"
+    ]
+
+    # 17.7 is First Line Calls. Insert the call charts there.
+    append_chart_group_to_section(
+        page_id=page_id,
+        heading_contains=TARGET_HEADING,
+        chart_specs=call_chart_specs,
+        uploaded_by_key=uploaded_by_key,
         review_week=review_week,
     )
 
-    print(
-        "Inserted all First Line Support charts after fallback anchor "
-        f"{block_plain_text(fallback_anchor)!r}."
+    # 17.8 is First Line Chats. Insert the chat chart there.
+    append_chart_group_to_section(
+        page_id=page_id,
+        heading_contains=TARGET_CHATS_HEADING,
+        chart_specs=chat_chart_specs,
+        uploaded_by_key=uploaded_by_key,
+        review_week=review_week,
     )
 
 
@@ -2668,6 +2722,8 @@ def print_setup():
     print(f"REPORTING_WEEK: {REPORTING_WEEK}")
     print(f"NEW_WBR_TITLE: {NEW_WBR_TITLE}")
     print(f"CSV_DIR: {CSV_DIR}")
+    print(f"TARGET_HEADING: {TARGET_HEADING}")
+    print(f"TARGET_CHATS_HEADING: {TARGET_CHATS_HEADING}")
     print()
 
 
