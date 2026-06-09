@@ -63,6 +63,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
+BUILD_WBR_VERSION = "2026-06-09-anchor-fix-v3"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -895,14 +896,28 @@ def is_heading_block(block):
 
 
 def collect_heading_texts_recursive(parent_block_id, depth=0, max_depth=None):
-    """Collect heading texts from a page/block in Notion display order."""
+    """Collect heading texts from a page/block in Notion display order.
+
+    Skips previously generated automated chart sections so tail recovery does
+    not treat old automated chart headings as missing template content.
+    """
     if max_depth is not None and depth > max_depth:
         return []
 
     headings = []
+    skipping_auto_section = False
 
     for block in list_block_children(parent_block_id):
         text = block_plain_text(block)
+
+        if AUTO_CHARTS_START in text:
+            skipping_auto_section = True
+            continue
+
+        if skipping_auto_section:
+            if AUTO_CHARTS_END in text:
+                skipping_auto_section = False
+            continue
 
         if is_heading_block(block) and text:
             headings.append(text)
@@ -1032,6 +1047,26 @@ def recover_missing_template_tail(source_page_id, target_page_id):
             "skipped": 0,
             "failed": 0,
             "first_missing_heading": None,
+        }
+
+    old_chart_headings = {
+        "1 Week View",
+        "Inbound",
+        "Outbound",
+        "Chats",
+    }
+
+    if first_missing_heading in old_chart_headings:
+        print(
+            f"Skipping tail recovery because first missing heading {first_missing_heading!r} "
+            "looks like an old automated chart section."
+        )
+        return {
+            "recovered": False,
+            "created": 0,
+            "skipped": 0,
+            "failed": 0,
+            "first_missing_heading": first_missing_heading,
         }
 
     print(f"First missing heading detected: {first_missing_heading!r}")
@@ -1732,36 +1767,6 @@ def upload_file_to_notion(file_path):
     return response.json()
 
 
-def find_block_after_heading(page_id, heading_contains, target_text):
-    children = list_block_children(page_id)
-    inside_target_section = False
-
-    for block in children:
-        block_type = block.get("type")
-        text = block_plain_text(block)
-
-        if block_type in {"heading_1", "heading_2", "heading_3"}:
-            if heading_contains.lower() in text.lower():
-                inside_target_section = True
-                print(f"Found target heading: {text!r}")
-                print(f"Heading block ID: {block['id']}")
-                continue
-
-            if inside_target_section:
-                print(
-                    "Reached next heading before finding anchor. "
-                    f"Next heading was: {text!r}"
-                )
-                return None
-
-        if inside_target_section and target_text.lower() in text.lower():
-            print(f"Found anchor block: {text!r}")
-            print(f"Anchor block ID: {block['id']}")
-            return block
-
-    return None
-
-
 def cleanup_existing_first_line_auto_charts(page_id):
     """Archive previous automated chart blocks safely, including nested blocks.
 
@@ -1850,30 +1855,45 @@ def flatten_blocks_recursive(parent_block_id, depth=0, max_depth=None):
     return flattened
 
 
-def find_block_after_heading(page_id, heading_contains, target_text):
-    """Find a target anchor inside a heading section, even if nested.
+def normalize_anchor_text(value):
+    return " ".join(str(value or "").strip().lower().split())
 
-    The search starts when a heading contains `heading_contains` and stops when
-    the next heading of the same or higher level is reached. This makes the
-    chart placement more reliable in copied Notion pages where sections can be
-    nested inside toggles/columns.
+
+def is_auto_chart_block_text(text):
+    text = text or ""
+    return AUTO_CHARTS_START in text or AUTO_CHARTS_END in text
+
+
+def find_block_after_heading(page_id, heading_contains, target_text):
+    """Find an anchor inside a heading section, ignoring generated chart blocks.
+
+    Rules:
+    - Start inside the section whose heading contains `heading_contains`.
+    - Stop when the next heading of the same or higher level is reached.
+    - Ignore AUTO_CHARTS marker blocks and generated chart headings.
+    - Prefer exact text match, then fallback to contains match.
     """
     blocks = flatten_blocks_recursive(page_id, max_depth=MAX_COPY_DEPTH + 3)
+
     inside_target_section = False
     target_heading_level = None
+    target_norm = normalize_anchor_text(target_text)
+
+    exact_match = None
+    contains_match = None
 
     for block in blocks:
-        block_type = block.get("type")
         text = block_plain_text(block)
+        text_norm = normalize_anchor_text(text)
         level = heading_level(block)
+
+        # Critical fix: never match generated chart markers as anchors.
+        if is_auto_chart_block_text(text):
+            continue
 
         if level is not None:
             if inside_target_section and target_heading_level is not None and level <= target_heading_level:
-                print(
-                    "Reached next same/higher heading before finding anchor. "
-                    f"Next heading was: {text!r}"
-                )
-                return None
+                break
 
             if heading_contains.lower() in text.lower():
                 inside_target_section = True
@@ -1882,10 +1902,28 @@ def find_block_after_heading(page_id, heading_contains, target_text):
                 print(f"Heading block ID: {block['id']}")
                 continue
 
-        if inside_target_section and target_text.lower() in text.lower():
-            print(f"Found anchor block for {target_text!r}: {text!r}")
-            print(f"Anchor block ID: {block['id']}")
-            return block
+        if not inside_target_section:
+            continue
+
+        if not text_norm:
+            continue
+
+        # Exact match is safest: "Outbound" should not match generated text.
+        if text_norm == target_norm:
+            exact_match = block
+            break
+
+        # Fallback contains match, but still never generated marker text.
+        if target_norm in text_norm and not is_auto_chart_block_text(text):
+            if contains_match is None:
+                contains_match = block
+
+    selected = exact_match or contains_match
+
+    if selected:
+        print(f"Found anchor block for {target_text!r}: {block_plain_text(selected)!r}")
+        print(f"Anchor block ID: {selected['id']}")
+        return selected
 
     return None
 
@@ -1964,8 +2002,12 @@ def append_single_first_line_chart(page_id, after_block, chart, review_week):
 def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_week):
     uploaded_by_key = {chart["key"]: chart for chart in uploaded_charts}
 
+    anchors_by_key = {}
+
+    # First pass: find all original anchors before inserting anything.
+    # This prevents newly inserted AUTO_CHARTS blocks from being matched as anchors
+    # for later charts.
     for spec in chart_specs:
-        chart = uploaded_by_key[spec["key"]]
         anchor_text = spec["anchor_text"]
         anchor_block = find_block_after_heading(
             page_id=page_id,
@@ -1980,13 +2022,21 @@ def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_we
                 "If the template uses different wording, set the matching TARGET_*_ANCHOR_TEXT env var."
             )
 
+        anchors_by_key[spec["key"]] = anchor_block
+
+    # Second pass: insert charts after the anchors we already captured.
+    for spec in chart_specs:
+        chart = uploaded_by_key[spec["key"]]
+        anchor_block = anchors_by_key[spec["key"]]
+
         append_single_first_line_chart(
             page_id=page_id,
             after_block=anchor_block,
             chart=chart,
             review_week=review_week,
         )
-        print(f"Inserted chart {chart['title']!r} after anchor {anchor_text!r}.")
+
+        print(f"Inserted chart {chart['title']!r} after anchor {spec['anchor_text']!r}.")
 
 
 def available_csv_fields(rows):
@@ -2467,6 +2517,7 @@ def print_setup():
     print("=" * 100)
     print("LOCAL WBR ALL-IN-ONE AUTOMATION")
     print("=" * 100)
+    print(f"Build script version: {BUILD_WBR_VERSION}")
     print(f"Current folder: {Path.cwd()}")
     print(f"Mode: {WBR_AUTOMATION_MODE}")
     print(f"NOTION_DATABASE_ID: {NOTION_DATABASE_ID}")
