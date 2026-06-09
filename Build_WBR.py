@@ -63,7 +63,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-anchor-fix-v3"
+BUILD_WBR_VERSION = "2026-06-09-anchor-fix-v4-group-fallback"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -1999,10 +1999,68 @@ def append_single_first_line_chart(page_id, after_block, chart, review_week):
     )
 
 
+def build_chart_blocks(chart, review_week):
+    """Build the marker, heading, image, and end marker blocks for one chart."""
+    start_marker = f"{AUTO_CHARTS_START}_{chart['key']}"
+    end_marker = f"{AUTO_CHARTS_END}_{chart['key']}"
+
+    return [
+        {
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": start_marker}}
+                ]
+            },
+        },
+        {
+            "type": "heading_3",
+            "heading_3": {
+                "rich_text": [
+                    {
+                        "type": "text",
+                        "text": {"content": f"{chart['title']} — {review_week}"},
+                    }
+                ]
+            },
+        },
+        image_block_from_uploaded_chart(chart),
+        {
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": end_marker}}
+                ]
+            },
+        },
+    ]
+
+
+def append_chart_group_after_anchor(page_id, after_block, charts, review_week):
+    """Append all charts after one anchor in the intended order.
+
+    This is used when the copied template has only one First Line Support anchor
+    such as 'New Daily 1 Week View' and does not contain separate Inbound,
+    Outbound, and Chats anchors.
+    """
+    parent_id = get_append_parent_id(page_id, after_block)
+
+    children = []
+    for chart in charts:
+        children.extend(build_chart_blocks(chart, review_week))
+
+    return notion_request(
+        "PATCH",
+        f"/blocks/{parent_id}/children",
+        json={"after": after_block["id"], "children": children},
+    )
+
+
 def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_week):
     uploaded_by_key = {chart["key"]: chart for chart in uploaded_charts}
 
     anchors_by_key = {}
+    missing_specs = []
 
     # First pass: find all original anchors before inserting anything.
     # This prevents newly inserted AUTO_CHARTS blocks from being matched as anchors
@@ -2015,28 +2073,65 @@ def append_first_line_chart_set(page_id, chart_specs, uploaded_charts, review_we
             target_text=anchor_text,
         )
 
-        if not anchor_block:
-            raise RuntimeError(
-                "Could not find the First Line Support chart anchor. "
-                f"Expected heading containing {TARGET_HEADING!r} and anchor text {anchor_text!r}. "
-                "If the template uses different wording, set the matching TARGET_*_ANCHOR_TEXT env var."
+        if anchor_block:
+            anchors_by_key[spec["key"]] = anchor_block
+        else:
+            missing_specs.append(spec)
+
+    # If all anchors exist, insert each chart after its matching anchor.
+    if not missing_specs:
+        for spec in chart_specs:
+            chart = uploaded_by_key[spec["key"]]
+            anchor_block = anchors_by_key[spec["key"]]
+
+            append_single_first_line_chart(
+                page_id=page_id,
+                after_block=anchor_block,
+                chart=chart,
+                review_week=review_week,
             )
 
-        anchors_by_key[spec["key"]] = anchor_block
+            print(f"Inserted chart {chart['title']!r} after anchor {spec['anchor_text']!r}.")
 
-    # Second pass: insert charts after the anchors we already captured.
-    for spec in chart_specs:
-        chart = uploaded_by_key[spec["key"]]
-        anchor_block = anchors_by_key[spec["key"]]
+        return
 
-        append_single_first_line_chart(
-            page_id=page_id,
-            after_block=anchor_block,
-            chart=chart,
-            review_week=review_week,
+    print(
+        "Some First Line Support anchors were not found: "
+        + ", ".join(spec["anchor_text"] for spec in missing_specs)
+    )
+    print(
+        "Falling back to inserting all First Line Support charts as one group "
+        "after the first available First Line Support anchor."
+    )
+
+    # Prefer the explicit 1-week anchor, since this is the one present in the
+    # current template. If not available, use the first anchor found.
+    fallback_anchor = anchors_by_key.get("inbound_weekly")
+
+    if not fallback_anchor and anchors_by_key:
+        fallback_anchor = next(iter(anchors_by_key.values()))
+
+    if not fallback_anchor:
+        raise RuntimeError(
+            "Could not find any First Line Support chart anchor. "
+            f"Expected heading containing {TARGET_HEADING!r} and at least one of: "
+            + ", ".join(spec["anchor_text"] for spec in chart_specs)
+            + ". If the template uses different wording, set the matching TARGET_*_ANCHOR_TEXT env var."
         )
 
-        print(f"Inserted chart {chart['title']!r} after anchor {spec['anchor_text']!r}.")
+    charts_in_order = [uploaded_by_key[spec["key"]] for spec in chart_specs]
+
+    append_chart_group_after_anchor(
+        page_id=page_id,
+        after_block=fallback_anchor,
+        charts=charts_in_order,
+        review_week=review_week,
+    )
+
+    print(
+        "Inserted all First Line Support charts after fallback anchor "
+        f"{block_plain_text(fallback_anchor)!r}."
+    )
 
 
 def available_csv_fields(rows):
