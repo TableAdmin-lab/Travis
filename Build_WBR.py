@@ -63,7 +63,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-anchor-fix-v4-group-fallback"
+BUILD_WBR_VERSION = "2026-06-09-tail-chat-fix-v5"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -721,10 +721,10 @@ def append_children(parent_block_id, children_payloads):
 def copy_block_children(source_parent_id, target_parent_id, depth=0):
     """Copy block children sequentially and recursively.
 
-    Important: this skips any previously generated automated chart section from
-    the source template. The template may already contain AUTO_CHARTS markers
-    from a previous test run. If those markers are copied, the later cleanup
-    step can archive too much content after 17.7. So the copied WBR starts clean.
+    Important: this skips previously generated automated chart sections from
+    the source template, but it will not skip the rest of the report if an old
+    generated section is missing its END marker. That was the cause of WBRs
+    stopping at 17.7 instead of continuing through section 20.
     """
     if depth > MAX_COPY_DEPTH:
         print(f"Reached MAX_COPY_DEPTH={MAX_COPY_DEPTH}, stopping at {source_parent_id}")
@@ -736,7 +736,10 @@ def copy_block_children(source_parent_id, target_parent_id, depth=0):
     skipped_count = 0
     failed_count = 0
     flattened_count = 0
+
     skipping_auto_chart_section = False
+    skipped_auto_chart_blocks = 0
+    max_auto_chart_blocks = int(os.getenv("MAX_AUTO_CHART_BLOCKS", "25"))
 
     print(
         f"{'  ' * depth}Copying {len(source_children)} child blocks "
@@ -750,6 +753,7 @@ def copy_block_children(source_parent_id, target_parent_id, depth=0):
 
         if AUTO_CHARTS_START in source_text:
             skipping_auto_chart_section = True
+            skipped_auto_chart_blocks = 1
             skipped_count += 1
             print(
                 f"{'  ' * depth}Skipping old automated chart section from template "
@@ -759,12 +763,27 @@ def copy_block_children(source_parent_id, target_parent_id, depth=0):
 
         if skipping_auto_chart_section:
             skipped_count += 1
+            skipped_auto_chart_blocks += 1
+
             if AUTO_CHARTS_END in source_text:
                 skipping_auto_chart_section = False
+                skipped_auto_chart_blocks = 0
                 print(
                     f"{'  ' * depth}Finished skipping old automated chart section "
                     f"at block {index}/{len(source_children)}"
                 )
+                continue
+
+            if skipped_auto_chart_blocks >= max_auto_chart_blocks:
+                skipping_auto_chart_section = False
+                skipped_auto_chart_blocks = 0
+                print(
+                    f"{'  ' * depth}WARNING: Old automated chart section had no end marker "
+                    f"within {max_auto_chart_blocks} blocks. Resuming template copy so later "
+                    "WBR sections are not lost."
+                )
+                continue
+
             continue
 
         payload = block_to_create_payload(source_block)
@@ -869,6 +888,7 @@ def copy_block_children(source_parent_id, target_parent_id, depth=0):
         "failed": failed_count,
         "flattened": flattened_count,
     }
+
 
 def create_duplicate_item(source_item, new_title, reporting_week):
     parent = source_item.get("parent")
@@ -2175,18 +2195,47 @@ def percent_series_for_field(rows, field):
     return [parse_percent(row.get(field)) for row in rows]
 
 
+def find_first_available_field(rows, exact_candidates=None, keyword_groups=None):
+    fields = available_csv_fields(rows)
+    lower_to_field = {field.lower(): field for field in fields}
+
+    for candidate in exact_candidates or []:
+        if not candidate:
+            continue
+        field = lower_to_field.get(candidate.lower())
+        if field:
+            return field
+
+    for keywords in keyword_groups or []:
+        for field in fields:
+            field_lower = field.lower()
+            if all(keyword.lower() in field_lower for keyword in keywords):
+                return field
+
+    return None
+
+
 def choose_chat_fields(rows):
-    count_field = find_field(
+    """Pick chat fields in the same shape as the manual Looker chat examples.
+
+    Expected examples:
+    - bar: Agent/Eligible chats
+    - lines: AI CSAT Chat, AI CSAT Chat Participation Rate, CSAT Chat,
+      CSAT Chat Participation
+    """
+    count_field = find_first_available_field(
         rows,
         exact_candidates=[
             os.getenv("CHAT_COUNT_FIELD", ""),
             "Eligible Chats [#]",
+            "Agent Handled Chats [#]",
             "Total Chats [#]",
             "Chats [#]",
             "Conversations [#]",
             "Solved Chats [#]",
         ],
         keyword_groups=[
+            ["agent", "handled", "chat", "#"],
             ["eligible", "chat", "#"],
             ["total", "chat", "#"],
             ["chat", "#"],
@@ -2194,55 +2243,54 @@ def choose_chat_fields(rows):
         ],
     )
 
-    csat_field = find_field(
-        rows,
-        exact_candidates=[
-            os.getenv("CHAT_CSAT_FIELD", ""),
-            "AI CSAT Chat [%]",
-            "CSAT Chat [%]",
-            "Chat CSAT [%]",
-        ],
-        keyword_groups=[
-            ["csat", "chat", "%"],
-            ["ai csat", "%"],
-            ["csat", "%"],
-        ],
-    )
+    ordered_percent_candidates = [
+        os.getenv("CHAT_AI_CSAT_FIELD", ""),
+        "AI CSAT Chat [%]",
+        os.getenv("CHAT_AI_CSAT_PARTICIPATION_FIELD", ""),
+        "AI CSAT Chat Participation Rate [%]",
+        os.getenv("CHAT_CSAT_FIELD", ""),
+        "CSAT Chat [%]",
+        "Chat CSAT [%]",
+        os.getenv("CHAT_CSAT_PARTICIPATION_FIELD", ""),
+        "CSAT Chat Participation [%]",
+        "CSAT Chat Participation Rate [%]",
+        "Chat CSAT Participation [%]",
+        "Chat CSAT Participation Rate [%]",
+    ]
 
-    participation_field = find_field(
-        rows,
-        exact_candidates=[
-            os.getenv("CHAT_PARTICIPATION_FIELD", ""),
-            "AI CSAT Chat Participation Rate [%]",
-            "Chat CSAT Participation Rate [%]",
-        ],
-        keyword_groups=[
-            ["participation", "chat", "%"],
-            ["participation", "%"],
-        ],
-    )
+    fields = available_csv_fields(rows)
+    lower_to_field = {field.lower(): field for field in fields}
+    percent_fields = []
+    seen = set()
 
-    missed_field = find_field(
-        rows,
-        exact_candidates=[
-            os.getenv("CHAT_MISSED_FIELD", ""),
-            "Missed Chat Rate [%]",
-            "Abandoned Chat Rate [%]",
-        ],
-        keyword_groups=[
-            ["missed", "chat", "%"],
-            ["abandoned", "chat", "%"],
-            ["abandon", "chat", "%"],
-        ],
-    )
+    for candidate in ordered_percent_candidates:
+        if not candidate:
+            continue
+        field = lower_to_field.get(candidate.lower())
+        if field and field not in seen:
+            percent_fields.append(field)
+            seen.add(field)
 
-    percent_fields = [field for field in [missed_field, csat_field, participation_field] if field]
+    # Fallback for unusual chat exports: add any remaining chat csat /
+    # participation percentage fields in source order.
+    for field in fields:
+        field_lower = field.lower()
+        if field in seen:
+            continue
+        if "%" not in field:
+            continue
+        if "chat" in field_lower and (
+            "csat" in field_lower
+            or "participation" in field_lower
+        ):
+            percent_fields.append(field)
+            seen.add(field)
 
     if not count_field and not percent_fields:
         raise RuntimeError(
             "Could not identify chat metrics in the chats CSV. Available fields were: "
             + ", ".join(available_csv_fields(rows))
-            + ". Set CHAT_COUNT_FIELD / CHAT_CSAT_FIELD / CHAT_PARTICIPATION_FIELD / CHAT_MISSED_FIELD in the workflow if needed."
+            + ". Set CHAT_COUNT_FIELD / CHAT_AI_CSAT_FIELD / CHAT_AI_CSAT_PARTICIPATION_FIELD / CHAT_CSAT_FIELD / CHAT_CSAT_PARTICIPATION_FIELD in the workflow if needed."
         )
 
     return count_field, percent_fields
