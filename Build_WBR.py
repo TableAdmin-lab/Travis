@@ -49,6 +49,7 @@ import copy
 import csv
 import math
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -63,7 +64,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-section-17-8-no-markers-v6"
+BUILD_WBR_VERSION = "2026-06-09-section-17-8-copy-fix-v7"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -763,29 +764,40 @@ def copy_block_children(source_parent_id, target_parent_id, depth=0):
             continue
 
         if skipping_auto_chart_section:
-            skipped_count += 1
-            skipped_auto_chart_blocks += 1
-
-            if AUTO_CHARTS_END in source_text:
+            # If the old auto chart section has no end marker, do not skip real
+            # WBR headings such as 17.8, 18, 19, or 20. Resume copying and let
+            # this same block be processed normally below.
+            if is_heading_block(source_block) and looks_like_wbr_section_heading(source_text):
                 skipping_auto_chart_section = False
                 skipped_auto_chart_blocks = 0
                 print(
-                    f"{'  ' * depth}Finished skipping old automated chart section "
-                    f"at block {index}/{len(source_children)}"
+                    f"{'  ' * depth}Detected real WBR section heading while skipping old charts: "
+                    f"{source_text!r}. Resuming normal template copy."
                 )
-                continue
+            else:
+                skipped_count += 1
+                skipped_auto_chart_blocks += 1
 
-            if skipped_auto_chart_blocks >= max_auto_chart_blocks:
-                skipping_auto_chart_section = False
-                skipped_auto_chart_blocks = 0
-                print(
-                    f"{'  ' * depth}WARNING: Old automated chart section had no end marker "
-                    f"within {max_auto_chart_blocks} blocks. Resuming template copy so later "
-                    "WBR sections are not lost."
-                )
-                continue
+                if AUTO_CHARTS_END in source_text:
+                    skipping_auto_chart_section = False
+                    skipped_auto_chart_blocks = 0
+                    print(
+                        f"{'  ' * depth}Finished skipping old automated chart section "
+                        f"at block {index}/{len(source_children)}"
+                    )
+                    continue
 
-            continue
+                if skipped_auto_chart_blocks >= max_auto_chart_blocks:
+                    skipping_auto_chart_section = False
+                    skipped_auto_chart_blocks = 0
+                    print(
+                        f"{'  ' * depth}WARNING: Old automated chart section had no end marker "
+                        f"within {max_auto_chart_blocks} blocks. Resuming template copy so later "
+                        "WBR sections are not lost."
+                    )
+                    continue
+
+                continue
 
         payload = block_to_create_payload(source_block)
 
@@ -914,6 +926,12 @@ def create_duplicate_item(source_item, new_title, reporting_week):
 
 def is_heading_block(block):
     return block.get("type") in {"heading_1", "heading_2", "heading_3"}
+
+
+def looks_like_wbr_section_heading(text):
+    """Return True for WBR section headings like 17.8, 18, 19.2, 20, etc."""
+    cleaned = str(text or "").strip()
+    return bool(re.match(r"^\d+(?:\.\d+)*\b", cleaned))
 
 
 def collect_heading_texts_recursive(parent_block_id, depth=0, max_depth=None):
@@ -2063,17 +2081,63 @@ def append_chart_group_after_anchor(page_id, after_block, charts, review_week):
 
 
 
+def heading_candidate_texts(heading_contains):
+    value = str(heading_contains or "").strip()
+    candidates = [value]
+
+    # Robust fallback for the First Line Chats section. Some templates do not
+    # include the exact "17.8" string in copied text, but do include "Chats" or
+    # "First Line" + "Chat".
+    if value == TARGET_CHATS_HEADING or "17.8" in value or "chat" in value.lower():
+        candidates.extend([
+            "17.8",
+            "First Line Chats",
+            "First Line Chat",
+            "Chats",
+            "Chat",
+        ])
+
+    # De-duplicate while preserving order.
+    result = []
+    seen = set()
+    for item in candidates:
+        key = item.lower()
+        if item and key not in seen:
+            result.append(item)
+            seen.add(key)
+
+    return result
+
+
 def find_heading_block(page_id, heading_contains):
     """Find a heading block by text, including nested blocks."""
     blocks = flatten_blocks_recursive(page_id, max_depth=MAX_COPY_DEPTH + 3)
-    needle = str(heading_contains or "").lower().strip()
+    candidates = heading_candidate_texts(heading_contains)
 
-    for block in blocks:
-        text = block_plain_text(block)
-        if heading_level(block) is not None and needle in text.lower():
-            print(f"Found heading for {heading_contains!r}: {text!r}")
-            print(f"Heading block ID: {block['id']}")
-            return block
+    for candidate in candidates:
+        needle = str(candidate or "").lower().strip()
+
+        for block in blocks:
+            text = block_plain_text(block)
+            text_lower = text.lower()
+
+            if heading_level(block) is None:
+                continue
+
+            if needle in text_lower:
+                print(f"Found heading for {heading_contains!r} using candidate {candidate!r}: {text!r}")
+                print(f"Heading block ID: {block['id']}")
+                return block
+
+            # Extra-safe semantic match for chat headings.
+            if (
+                candidate.lower() in {"chats", "chat", "first line chats", "first line chat"}
+                and "chat" in text_lower
+                and ("first line" in text_lower or looks_like_wbr_section_heading(text))
+            ):
+                print(f"Found chat-like heading for {heading_contains!r}: {text!r}")
+                print(f"Heading block ID: {block['id']}")
+                return block
 
     return None
 
@@ -2169,6 +2233,42 @@ def append_chart_group_to_section(page_id, heading_contains, chart_specs, upload
             f"Inserted {len(charts_in_order)} chart(s) directly after heading "
             f"{block_plain_text(heading_block)!r}."
         )
+        return
+
+    # Last-resort fallback: if the chat section is genuinely missing from the
+    # copied template, create a visible heading at the end of the page and place
+    # the chart there rather than failing after the WBR page has already been
+    # created.
+    if heading_contains == TARGET_CHATS_HEADING or "17.8" in str(heading_contains):
+        print(
+            f"Could not find {heading_contains!r}. Creating a new chat section at the end of the WBR."
+        )
+        created = append_children(
+            page_id,
+            [
+                {
+                    "type": "heading_2",
+                    "heading_2": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": "17.8 First Line Chats"},
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
+        if not created:
+            raise RuntimeError("Failed to create fallback 17.8 First Line Chats heading.")
+
+        append_chart_group_after_heading(
+            page_id=page_id,
+            heading_block=created[0],
+            charts=charts_in_order,
+            review_week=review_week,
+        )
+        print("Inserted chat chart under newly created '17.8 First Line Chats' heading.")
         return
 
     raise RuntimeError(
