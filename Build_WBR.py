@@ -64,7 +64,7 @@ from PIL import Image, ImageDraw, ImageFont
 # =============================================================================
 
 BASE_URL = "https://api.notion.com/v1"
-BUILD_WBR_VERSION = "2026-06-09-two-chat-graphs-v8"
+BUILD_WBR_VERSION = "2026-06-09-two-chat-graphs-v9"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -2399,7 +2399,7 @@ def choose_chat_percent_fields(rows):
             percent_fields.append(field)
             seen.add(field)
 
-    # Fallback for unusual chat exports: add any remaining chat csat /
+    # Fallback for unusual chat exports: add any remaining chat CSAT /
     # participation percentage fields in source order.
     for field in fields:
         field_lower = field.lower()
@@ -2481,7 +2481,227 @@ def choose_bot_chat_fields(rows):
     return count_field, percent_fields
 
 
-def render_chat_chart(rows, output_path, chart_kind):
+def choose_chat_fields(rows):
+    """Backward-compatible default: agent chat chart."""
+    return choose_agent_chat_fields(rows)
+
+
+def render_generic_support_chart(rows, title, output_path, count_field=None, percent_fields=None):
+    dates = [row[DATE_FIELD] for row in rows]
+    percent_fields = percent_fields or []
+
+    count_values = []
+    if count_field:
+        count_values = [value or 0 for value in numeric_series_for_field(rows, count_field)]
+
+    percent_values_by_field = {
+        field: percent_series_for_field(rows, field)
+        for field in percent_fields
+    }
+
+    scale = 2
+    width, height = 1750 * scale, 980 * scale
+    plot_left = 215 * scale
+    plot_right = 1505 * scale
+    plot_top = 140 * scale
+    plot_bottom = 670 * scale
+    plot_width = plot_right - plot_left
+    plot_height = plot_bottom - plot_top
+
+    image = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(image)
+
+    font_title = load_font(38 * scale, bold=True)
+    font_axis = load_font(24 * scale, bold=True)
+    font_tick = load_font(22 * scale)
+    font_label = load_font(21 * scale, bold=True)
+    font_legend = load_font(21 * scale)
+
+    colors = {
+        "text": (44, 52, 62, 255),
+        "grid": (224, 226, 228, 255),
+        "axis": (164, 170, 179, 255),
+        "label_bg": (255, 255, 255, 225),
+        "count": (94, 196, 222, 255),
+        "line_1": (111, 154, 148, 255),
+        "line_2": (255, 137, 110, 255),
+        "line_3": (255, 194, 110, 255),
+        "line_4": (130, 116, 198, 255),
+    }
+
+    draw_centered_text(draw, (width / 2, 58 * scale), title, font_title, colors["text"])
+
+    max_count = max(count_values) if count_values else 1
+    left_axis_max = nice_axis_max(max_count * 1.16)
+
+    all_percent_values = [
+        value
+        for values in percent_values_by_field.values()
+        for value in values
+        if value is not None
+    ]
+    max_percent = max(all_percent_values) if all_percent_values else 1.0
+    right_axis_max = 1.0 if max_percent <= 1.0 else min(1.15, math.ceil(max_percent * 10) / 10)
+
+    side_padding = 78 * scale
+
+    def x_at(index):
+        if len(dates) == 1:
+            return (plot_left + plot_right) / 2
+        usable_width = plot_width - (2 * side_padding)
+        return plot_left + side_padding + (usable_width * index / (len(dates) - 1))
+
+    def y_left(value):
+        return plot_bottom - (value / left_axis_max) * plot_height
+
+    def y_right(value):
+        return plot_bottom - (value / right_axis_max) * plot_height
+
+    def draw_value_label(text, center_x, center_y, font, fill):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        label_x = center_x - text_width / 2
+        label_y = center_y - text_height / 2
+
+        label_x = max(plot_left + 4 * scale, min(plot_right - text_width - 4 * scale, label_x))
+        label_y = max(plot_top + 4 * scale, min(plot_bottom - text_height - 4 * scale, label_y))
+
+        draw.rounded_rectangle(
+            (
+                label_x - 4 * scale,
+                label_y - 3 * scale,
+                label_x + text_width + 4 * scale,
+                label_y + text_height + 5 * scale,
+            ),
+            radius=4 * scale,
+            fill=colors["label_bg"],
+        )
+        draw.text((label_x, label_y), text, font=font, fill=fill)
+
+    for index in range(6):
+        tick = left_axis_max * index / 5
+        y = y_left(tick)
+        draw.line((plot_left, y, plot_right, y), fill=colors["grid"], width=2 * scale)
+        label = format_count(tick)
+        bbox = draw.textbbox((0, 0), label, font=font_tick)
+        draw.text(
+            (plot_left - 24 * scale - (bbox[2] - bbox[0]), y - 13 * scale),
+            label,
+            font=font_tick,
+            fill=colors["text"],
+        )
+
+    for index in range(6):
+        pct = right_axis_max * index / 5
+        y = y_right(pct)
+        label = f"{pct * 100:.0f}%"
+        draw.text((plot_right + 24 * scale, y - 13 * scale), label, font=font_tick, fill=colors["text"])
+
+    draw.line((plot_left, plot_bottom, plot_right, plot_bottom), fill=colors["axis"], width=2 * scale)
+    draw.line((plot_left, plot_top, plot_left, plot_bottom), fill=colors["axis"], width=2 * scale)
+    draw.line((plot_right, plot_top, plot_right, plot_bottom), fill=colors["axis"], width=2 * scale)
+
+    if count_field:
+        slot = (plot_width - 2 * side_padding) / max(len(dates) - 1, 1)
+        bar_width = min(92 * scale, slot * 0.58)
+        for index, value in enumerate(count_values):
+            x = x_at(index)
+            y = y_left(value)
+            draw.rounded_rectangle(
+                (x - bar_width / 2, y, x + bar_width / 2, plot_bottom),
+                radius=4 * scale,
+                fill=colors["count"],
+            )
+            draw_value_label(format_count(value), x, y - 18 * scale, font_label, colors["count"])
+
+    line_colors = [colors["line_1"], colors["line_2"], colors["line_3"], colors["line_4"]]
+
+    for field_index, (field, values) in enumerate(percent_values_by_field.items()):
+        color = line_colors[field_index % len(line_colors)]
+        points = []
+        for index, value in enumerate(values):
+            if value is None:
+                continue
+            points.append((x_at(index), y_right(value), value, index))
+
+        if len(points) >= 2:
+            draw.line([(x, y) for x, y, _, _ in points], fill=color, width=4 * scale)
+
+        for x, y, value, index in points:
+            draw.ellipse((x - 7 * scale, y - 7 * scale, x + 7 * scale, y + 7 * scale), fill=color)
+            draw_value_label(
+                format_percent(value),
+                x,
+                y - (26 + field_index * 22) * scale,
+                font_label,
+                color,
+            )
+
+    for index, date_label in enumerate(dates):
+        x = x_at(index)
+        display_date = date_label[5:] if len(date_label) >= 10 else date_label
+        bbox = draw.textbbox((0, 0), display_date, font=font_tick)
+        draw.text(
+            (x - (bbox[2] - bbox[0]) / 2, plot_bottom + 22 * scale),
+            display_date,
+            font=font_tick,
+            fill=colors["text"],
+        )
+
+    draw_centered_text(
+        draw,
+        ((plot_left + plot_right) / 2, plot_bottom + 72 * scale),
+        DATE_FIELD,
+        font_axis,
+        colors["text"],
+    )
+
+    left_axis_label = count_field or "Count"
+    draw_rotated_text(
+        image,
+        (58 * scale, (plot_top + plot_bottom) / 2),
+        left_axis_label,
+        font_axis,
+        colors["count"],
+        90,
+    )
+    draw_rotated_text(
+        image,
+        (1680 * scale, (plot_top + plot_bottom) / 2),
+        "[%]",
+        font_axis,
+        colors["text"],
+        90,
+    )
+
+    legend_items = []
+    if count_field:
+        legend_items.append((count_field, colors["count"]))
+    for field_index, field in enumerate(percent_values_by_field.keys()):
+        legend_items.append((field, line_colors[field_index % len(line_colors)]))
+
+    legend_y = 850 * scale
+    legend_total_width = 0
+    for text, _ in legend_items:
+        bbox = draw.textbbox((0, 0), text, font=font_legend)
+        legend_total_width += 38 * scale + (bbox[2] - bbox[0]) + 32 * scale
+
+    legend_x = max(60 * scale, (width - legend_total_width) / 2)
+    for text, color in legend_items:
+        draw.ellipse((legend_x, legend_y - 8 * scale, legend_x + 16 * scale, legend_y + 8 * scale), fill=color)
+        draw.text((legend_x + 24 * scale, legend_y - 13 * scale), text, font=font_legend, fill=colors["text"])
+        bbox = draw.textbbox((0, 0), text, font=font_legend)
+        legend_x += 38 * scale + (bbox[2] - bbox[0]) + 32 * scale
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image = image.convert("RGB").resize((width // scale, height // scale), Image.Resampling.LANCZOS)
+    image.save(output_path, "PNG", optimize=True)
+    return output_path
+
+
+def render_chat_chart(rows, output_path, chart_kind="agent"):
     if chart_kind == "agent":
         count_field, percent_fields = choose_agent_chat_fields(rows)
         title = "Agent Chat Metrics - CSAT"
@@ -2502,7 +2722,6 @@ def render_chat_chart(rows, output_path, chart_kind):
         count_field=count_field,
         percent_fields=percent_fields,
     )
-
 
 def generate_and_insert_first_line_charts(page_id):
     print()
