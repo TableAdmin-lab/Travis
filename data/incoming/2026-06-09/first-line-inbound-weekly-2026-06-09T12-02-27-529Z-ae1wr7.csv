@@ -1,0 +1,9 @@
+,Contact Center,Support,Support,Support,Support,Support,Support,Support
+,Interaction Date Dynamic,Eligible Calls [#],AI CSAT Call [%],AI CSAT Call Participation Rate [%],Abandoned Call Rate [%],Calls Within Hunting Time SLA [%],Average Call Hunting Time [min],Average Call Handling Time [min]
+1,2026-06-07,0,,,,,,
+2,2026-06-06,31,51.72%,96.67%,0.00%,100.00%,0.24,8.52
+3,2026-06-05,132,62.79%,101.57%,2.27%,84.85%,0.77,8.15
+4,2026-06-04,191,65.32%,99.43%,7.85%,72.77%,1.19,9.19
+5,2026-06-03,248,58.08%,98.71%,6.05%,77.82%,1.12,8.57
+6,2026-06-02,261,57.59%,103.70%,13.03%,54.41%,2.90,8.57
+7,2026-06-01,181,61.54%,97.69%,2.21%,80.11%,0.72,7.31
